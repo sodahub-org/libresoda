@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+*.m4a
+*.mp4
+*.wav
+*.tmp
+.cargo-home/
+
