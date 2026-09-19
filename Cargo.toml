@@ -28,6 +28,7 @@ base64 = "0.22"
 chromiumoxide = { version = "0.9", optional = true }
 futures = { version = "0.3", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "time"], optional = true }
+dirs = "6"
 
 [dev-dependencies]
 serde_json = "1"
