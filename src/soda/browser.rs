@@ -9,6 +9,7 @@
 
 use crate::error::{Result, SodaError};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -70,6 +71,45 @@ pub trait BrowserRequester: Send + Sync {
     fn request(&self, request: &BrowserRequest) -> Result<BrowserResponse>;
     /// 关闭该会话的浏览器上下文。默认空实现，签名服务不支持时静默跳过。
     fn close_session(&self, _session_key: &str) -> Result<()> {
+        Ok(())
+    }
+    /// 登记一次二次验证（`check_qrconnect` 返回 `error_code=2046` 时由
+    /// `qr_login` 调用）：决策 JSON 会原样回给验证窗口，网络请求经
+    /// `session_key` 对应的浏览器上下文代发。默认不支持。
+    fn register_second_verify(
+        &self,
+        _token: &str,
+        _session_key: &str,
+        _decision: &Value,
+        _general_params: &Value,
+    ) -> Result<()> {
+        Err(SodaError::http(
+            "当前签名服务不支持二次验证窗口，请改用官方客户端完成验证后导出 Cookie",
+        ))
+    }
+    /// 二次验证窗口的地址（用系统浏览器打开；token 作为能力凭证）。
+    fn second_verify_url(&self, _token: &str) -> Result<String> {
+        Err(SodaError::http(
+            "当前签名服务不支持二次验证窗口，请改用官方客户端完成验证后导出 Cookie",
+        ))
+    }
+    /// 在签名页浏览器里打开**可见**的二次验证窗口（同一浏览器上下文，
+    /// cookie/设备身份自动对齐，无 CORS 缝隙）。默认不支持。
+    fn open_second_verify_window(&self, _token: &str) -> Result<String> {
+        Err(SodaError::http(
+            "当前签名服务不支持在浏览器窗口中打开二次验证",
+        ))
+    }
+    /// 用户是否已在验证窗口里完成验证（由验证页回执置位）。
+    fn second_verify_done(&self, _token: &str) -> bool {
+        false
+    }
+    /// 消费「已完成」标志（重发确认前调用，避免同一完成回执触发多次重发）。
+    fn ack_second_verify(&self, _token: &str) -> Result<()> {
+        Ok(())
+    }
+    /// 清理二次验证登记（登录结束/过期时调用）。
+    fn clear_second_verify(&self, _token: &str) -> Result<()> {
         Ok(())
     }
     fn name(&self) -> &'static str;

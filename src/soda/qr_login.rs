@@ -14,11 +14,17 @@
 //!    扫原样地址才会走到 `confirmed`（`qrcode_index_url` 用浏览器直接打开确实 404，
 //!    但那是网页行为，跟 App 扫码无关）；
 //! 4. 轮询 `POST /passport/web/check_qrconnect/`，`error_code=7` 只当**临时限流**
-//!    （冷却 5s、建议 60s 后重试，不判失败）；`2`/`expired` 才是过期；`2046` 是二次验证；
+//!    （冷却 5s、建议 60s 后重试，不判失败）；`2`/`expired` 才是过期；
+//!    `2046` 是二次验证；
 //! 5. 成功后的登录态**不在响应体里**，而在「签名页浏览器会话」的 cookie jar 中：
 //!    确认后跟一跳 `redirect_url` 把 cookie 引出来，再校验
 //!    `sessionid|sessionid_ss|sid_guard|sid_tt`。因此登录请求必须经签名页
-//!    （`a_bogus`）发出 —— 实测本地直连会一路 `error_code=7`。
+//!    （`a_bogus`）发出 —— 实测本地直连会一路 `error_code=7`；
+//! 6. **二次验证（2046）闭环**：决策登记到签名页（`register_second_verify`），
+//!    官方验证组件在用户浏览器打开的 `security_host.html` 里运行，其网络请求经
+//!    桥接路由回签名页上下文代发；窗口回执「完成」后，带原决策的 `biz_params`
+//!    重发 `check_qrconnect`（`isResend=true`）换取登录态（对齐 Meting-API 的
+//!    `completeQishuiSecondVerify`）。
 
 use super::Soda;
 use crate::error::{Result, SodaError};
@@ -45,6 +51,9 @@ const MIN_CHECK_INTERVAL_MS: i64 = 2_500;
 /// 注意别写成 60 秒：`retry_after_ms=60000` 只是给客户端的**提示**，真按 60 秒冷却
 /// 会把「扫码后确认」的窗口整段跳过，表现为一直卡在 `scanned`（实测踩过）。
 const RATE_LIMIT_COOLDOWN_MS: i64 = 5_000;
+/// 二次验证期间的会话寿命：官方验证组件的交互（滑块/短信/人脸）可能超过
+/// 普通 3 分钟 TTL，窗口回执由轮询侧领走，所以挂起验证的会话放宽到 10 分钟。
+const SECOND_VERIFY_TTL_MS: i64 = 10 * 60 * 1000;
 
 // ---------------------------------------------------------------------------
 // 会话
@@ -69,6 +78,10 @@ pub struct QrSession {
     pub last_check_ms: i64,
     pub cooldown_until_ms: i64,
     pub last_result: Option<QRLoginResult>,
+    /// 二次验证（`error_code=2046`）的决策（响应 `data` 原样）：验证窗口要靠它
+    /// 渲染官方组件，完成后重发确认时也要回带其中的 `biz_params`。
+    #[serde(default)]
+    pub second_verify: Option<Value>,
 }
 
 /// 会话持久化路径：设置 `SODA_QR_STATE` 后，创建与轮询可以分两次进程完成。
@@ -104,7 +117,14 @@ fn sessions() -> &'static Mutex<HashMap<String, QrSession>> {
 fn cleanup_sessions() {
     let now = now_millis();
     if let Ok(mut map) = sessions().lock() {
-        map.retain(|_, session| now - session.created_ms < SESSION_TTL_MS);
+        map.retain(|_, session| {
+            let ttl = if session.second_verify.is_some() {
+                SECOND_VERIFY_TTL_MS
+            } else {
+                SESSION_TTL_MS
+            };
+            now - session.created_ms < ttl
+        });
     }
 }
 
@@ -614,6 +634,7 @@ pub fn create_qr(soda: &Soda) -> Result<QrCreateResult> {
         last_check_ms: 0,
         cooldown_until_ms: 0,
         last_result: None,
+        second_verify: None,
     };
 
     let payload = request_passport(
@@ -734,6 +755,11 @@ pub fn check_qr(soda: &Soda, token: &str) -> Result<QRLoginResult> {
         None => return Err(SodaError::not_found("汽水二维码会话已过期，请重新生成")),
     };
     let now = now_millis();
+    // 二次验证窗口已回执完成：立即带决策重发确认，不走常规轮询节流
+    // （验证完成的时刻服务端状态就绪，越快领越好）。
+    if session.second_verify.is_some() && second_verify_done(soda, token) {
+        return complete_second_verify(soda, &mut session, token);
+    }
     if session.cooldown_until_ms > now {
         if let Some(last) = session.last_result.clone() {
             return Ok(last);
@@ -830,9 +856,7 @@ pub fn check_qr(soda: &Soda, token: &str) -> Result<QRLoginResult> {
     // 只看服务端状态判断是否确认。**不能**用「本地会话里已经有 sessionid」来判：
     // 签名页是共享的浏览器上下文，jar 里可能还留着上一次登录的 cookie，那样第一次
     // 轮询就会误判成登录成功（实测踩过）。jar 只在确认之后用来取 cookie 值。
-    let confirmed = matches!(raw_status.as_str(), "3" | "confirmed" | "success")
-        || data.get("logged_in").and_then(|item| item.as_bool()) == Some(true)
-        || data.get("session_cookie").is_some();
+    let confirmed = is_confirmed(&data, &raw_status);
 
     let build =
         |status: QRLoginStatus, message: &str, extra: BTreeMap<String, String>| QRLoginResult {
@@ -844,19 +868,23 @@ pub fn check_qr(soda: &Soda, token: &str) -> Result<QRLoginResult> {
             ..Default::default()
         };
 
-    // 二次验证
+    // 二次验证：登记决策供验证窗口领取（官方组件在用户浏览器里运行，
+    // 网络请求经签名页上下文代发），状态维持在 Scanned 等窗口回执。
     if error_code == 2046 {
+        session.second_verify = Some(data.clone());
+        if let Some(requester) = soda.browser_requester() {
+            let general = general_params_value(&session);
+            let _ = requester.register_second_verify(token, &session.session_key, &data, &general);
+        }
+        session_save(&session);
+        save_state(&session);
         let mut flags = extra.clone();
         flags.insert("need_second_verify".to_string(), "true".to_string());
         let result = build(
             QRLoginStatus::Scanned,
-            "请在汽水二次验证窗口中完成身份验证",
+            "需要二次验证，请在验证窗口中完成",
             flags,
         );
-        session.last_result = Some(result.clone());
-        session.last_check_ms = now;
-        session_save(&session);
-        save_state(&session);
         return Ok(result);
     }
 
@@ -869,6 +897,9 @@ pub fn check_qr(soda: &Soda, token: &str) -> Result<QRLoginResult> {
         );
         session_remove(token);
         close_browser_session(soda, &session);
+        if let Some(requester) = soda.browser_requester() {
+            let _ = requester.clear_second_verify(token);
+        }
         return Ok(result);
     }
 
@@ -901,70 +932,7 @@ pub fn check_qr(soda: &Soda, token: &str) -> Result<QRLoginResult> {
     }
 
     if confirmed {
-        // 从响应多处收集登录态（等价参考实现的 sessionCookie 列表）
-        let mut parts: Vec<String> = Vec::new();
-        for key in ["session_cookie", "cookie"] {
-            if let Some(value) = data.get(key).and_then(|item| item.as_str()) {
-                parts.push(value.to_string());
-            }
-            if let Some(value) = payload.get(key).and_then(|item| item.as_str()) {
-                parts.push(value.to_string());
-            }
-        }
-        for key in ["sessionid", "session_id"] {
-            if let Some(value) = data.get(key).and_then(|item| item.as_str()) {
-                parts.push(format!("sessionid={value}"));
-            }
-        }
-        if let Some(auth) = data.get("auth") {
-            for key in ["sessionid", "session_id"] {
-                if let Some(value) = auth.get(key).and_then(|item| item.as_str()) {
-                    parts.push(format!("sessionid={value}"));
-                }
-            }
-        }
-        session.cookie = merge_cookies(&session.cookie, &parts);
-
-        // 登录态通常既不在响应体里，也不在本次响应的 Set-Cookie 里，而是落在
-        // 「签名页浏览器会话」的 cookie jar 中（上游 signer 返回的就是整个上下文
-        // cookie）。若本地会话还没拿到 sessionid，就跟着 `redirect_url` 再走一跳，
-        // 把会话 cookie 引出来。
-        if !has_login_state(&session.cookie) {
-            if let Some(redirect) = data
-                .get("redirect_url")
-                .and_then(|item| item.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                harvest_cookies(soda, &mut session, redirect)?;
-            }
-        }
-        if !has_login_state(&session.cookie) {
-            return Err(SodaError::not_found(
-                "汽水扫码成功但没拿到登录态：扫码登录依赖签名页承接会话 cookie\
-（sodam/libresoda 正在使用内置 Rust CDP 签名页；请检查 Chromium 是否可用），请重新扫码",
-            ));
-        }
-        soda.set_cookie(session.cookie.clone());
-        session_remove(token);
-        // 登录态已经引到本地，浏览器上下文用完即关，避免设备身份被复用。
-        close_browser_session(soda, &session);
-        let mut cookies = BTreeMap::new();
-        for pair in session.cookie.split(';') {
-            if let Some((name, value)) = pair.trim().split_once('=') {
-                cookies.insert(name.to_string(), value.to_string());
-            }
-        }
-        let result = QRLoginResult {
-            source: crate::model::SOURCE_SODA.to_string(),
-            key: token.to_string(),
-            status: QRLoginStatus::Success,
-            message: "登录成功".to_string(),
-            cookie: session.cookie.clone(),
-            cookies,
-            extra,
-        };
-        return Ok(result);
+        return finish_confirmed(soda, &mut session, token, &data, &payload, extra);
     }
 
     // 默认：等待（含扫码已发生但未确认）
@@ -986,6 +954,272 @@ pub fn check_qr(soda: &Soda, token: &str) -> Result<QRLoginResult> {
     Ok(result)
 }
 
+// ---------------------------------------------------------------------------
+// 二次验证（`error_code=2046`）闭环
+// ---------------------------------------------------------------------------
+
+/// 签名页侧是否已收到验证窗口的「完成」回执。
+fn second_verify_done(soda: &Soda, token: &str) -> bool {
+    soda.browser_requester()
+        .map(|requester| requester.second_verify_done(token))
+        .unwrap_or(false)
+}
+
+/// 服务端是否已确认（只认服务端状态，不认本地 cookie jar）。
+fn is_confirmed(data: &Value, raw_status: &str) -> bool {
+    matches!(raw_status, "3" | "confirmed" | "success")
+        || data.get("logged_in").and_then(Value::as_bool) == Some(true)
+        || data.get("session_cookie").is_some()
+}
+
+/// `data.status` 归一化成小写字符串（数字/字符串都兼容）。
+fn status_text(data: &Value) -> String {
+    data.get("status")
+        .map(|item| match item {
+            Value::String(text) => text.trim().to_lowercase(),
+            Value::Number(number) => number.to_string(),
+            _ => String::new(),
+        })
+        .unwrap_or_default()
+}
+
+/// 公共参数快照（`Value` 形态），交给验证窗口里的官方组件（对齐 Meting 的
+/// `commonParams(session)`）。
+fn general_params_value(session: &QrSession) -> Value {
+    let params = common_params(session, &random_biz_trace_id());
+    Value::Object(
+        params
+            .iter()
+            .map(|(key, value)| (key.to_string(), Value::String(value.to_string())))
+            .collect(),
+    )
+}
+
+/// 归一化决策里的 `biz_params`（对齐 Meting 的 `normalizeBizParams`）：
+/// JSON 字符串 / `k=v&k2=v2` 查询串 / 对象都归成「字符串键值对」列表，
+/// 嵌套对象序列化成 JSON 文本，`null` 丢弃。
+pub(crate) fn normalize_biz_params(value: Option<&Value>) -> Vec<(String, String)> {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+    match value {
+        Value::Null => Vec::new(),
+        Value::String(text) => {
+            let text = text.trim();
+            if text.is_empty() {
+                return Vec::new();
+            }
+            // 优先按 JSON 解析（服务端常见形态）
+            if let Ok(parsed) = serde_json::from_str::<Value>(text) {
+                return normalize_biz_params(Some(&parsed));
+            }
+            // 退路：查询串形态
+            text.split('&')
+                .filter_map(|pair| {
+                    let (key, value) = pair.split_once('=')?;
+                    Some((
+                        crate::util::query_unescape(key).unwrap_or_else(|| key.to_string()),
+                        crate::util::query_unescape(value).unwrap_or_else(|| value.to_string()),
+                    ))
+                })
+                .filter(|(key, _)| !key.is_empty())
+                .collect()
+        }
+        Value::Object(map) => map
+            .iter()
+            .filter(|(_, value)| !value.is_null())
+            .map(|(key, value)| {
+                let text = match value {
+                    Value::String(text) => text.clone(),
+                    other => other.to_string(),
+                };
+                (key.clone(), text)
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// 确认后的收尾：从响应体多处收集登录态、必要时跟 `redirect_url` 一跳把签名页
+/// jar 里的 cookie 引出来、写回 `Soda`、清理会话。常规确认与二次验证重发确认
+/// 共用。
+fn finish_confirmed(
+    soda: &Soda,
+    session: &mut QrSession,
+    token: &str,
+    data: &Value,
+    payload: &Value,
+    extra: BTreeMap<String, String>,
+) -> Result<QRLoginResult> {
+    // 从响应多处收集登录态（等价参考实现的 sessionCookie 列表）
+    let mut parts: Vec<String> = Vec::new();
+    for key in ["session_cookie", "cookie"] {
+        if let Some(value) = data.get(key).and_then(Value::as_str) {
+            parts.push(value.to_string());
+        }
+        if let Some(value) = payload.get(key).and_then(Value::as_str) {
+            parts.push(value.to_string());
+        }
+    }
+    for key in ["sessionid", "session_id"] {
+        if let Some(value) = data.get(key).and_then(Value::as_str) {
+            parts.push(format!("sessionid={value}"));
+        }
+    }
+    if let Some(auth) = data.get("auth") {
+        for key in ["sessionid", "session_id"] {
+            if let Some(value) = auth.get(key).and_then(Value::as_str) {
+                parts.push(format!("sessionid={value}"));
+            }
+        }
+    }
+    session.cookie = merge_cookies(&session.cookie, &parts);
+
+    // 登录态通常既不在响应体里，也不在本次响应的 Set-Cookie 里，而是落在
+    // 「签名页浏览器会话」的 cookie jar 中（上游 signer 返回的就是整个上下文
+    // cookie）。若本地会话还没拿到 sessionid，就跟着 `redirect_url` 再走一跳，
+    // 把会话 cookie 引出来。
+    if !has_login_state(&session.cookie) {
+        if let Some(redirect) = data
+            .get("redirect_url")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            harvest_cookies(soda, session, redirect)?;
+        }
+    }
+    if !has_login_state(&session.cookie) {
+        return Err(SodaError::not_found(
+            "汽水扫码成功但没拿到登录态：扫码登录依赖签名页承接会话 cookie\
+（sodam/libresoda 正在使用内置 Rust CDP 签名页；请检查 Chromium 是否可用），请重新扫码",
+        ));
+    }
+    soda.set_cookie(session.cookie.clone());
+    session_remove(token);
+    // 登录态已经引到本地，浏览器上下文用完即关，避免设备身份被复用。
+    close_browser_session(soda, session);
+    if let Some(requester) = soda.browser_requester() {
+        let _ = requester.clear_second_verify(token);
+    }
+    let mut cookies = BTreeMap::new();
+    for pair in session.cookie.split(';') {
+        if let Some((name, value)) = pair.trim().split_once('=') {
+            cookies.insert(name.to_string(), value.to_string());
+        }
+    }
+    Ok(QRLoginResult {
+        source: crate::model::SOURCE_SODA.to_string(),
+        key: token.to_string(),
+        status: QRLoginStatus::Success,
+        message: "登录成功".to_string(),
+        cookie: session.cookie.clone(),
+        cookies,
+        extra,
+    })
+}
+
+/// 二次验证完成后，带原决策的 `biz_params` 重发扫码确认（对齐 Meting-API 的
+/// `completeQishuiSecondVerify`）：
+///
+/// * `error_code=2046` → 服务端仍要求验证：更新决策登记，回到等待；
+/// * 确认 → [`finish_confirmed`] 收尾发登录态；
+/// * 其余 → 等待文案（下一次轮询会重新走常规链路）。
+fn complete_second_verify(
+    soda: &Soda,
+    session: &mut QrSession,
+    token: &str,
+) -> Result<QRLoginResult> {
+    // 先消费「完成」回执：无论重发结果如何，都要等窗口下一次回执才重发，
+    // 避免同一完成事件触发多次重发把会话拖进限流。
+    if let Some(requester) = soda.browser_requester() {
+        let _ = requester.ack_second_verify(token);
+    }
+    let decision = session.second_verify.clone().unwrap_or(Value::Null);
+    let mut body = Params::new();
+    body.set("need_logo", "false");
+    body.set("need_short_url", "false");
+    body.set("is_frontier", "true");
+    body.set("token", token);
+    body.set("is_new_login", "1");
+    body.set("next", API_BASE);
+    for (key, value) in normalize_biz_params(decision.get("biz_params")) {
+        body.set(key, value);
+    }
+    let payload = request_passport(
+        soda,
+        session,
+        "POST",
+        "/passport/web/check_qrconnect/",
+        &[("isResend", "true")],
+        Some(&body),
+    )?;
+    let data = payload.get("data").cloned().unwrap_or(Value::Null);
+    let error_code = data.get("error_code").and_then(Value::as_i64).unwrap_or(0);
+    let raw_status = status_text(&data);
+    let description = data
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let mut extra: BTreeMap<String, String> = BTreeMap::new();
+    extra.insert("error_code".to_string(), error_code.to_string());
+    if !raw_status.is_empty() {
+        extra.insert("api_status".to_string(), raw_status.clone());
+    }
+
+    if error_code == 2046 {
+        // 服务端仍要求验证：刷新决策登记（可能下发新的验证方式），继续等窗口回执
+        session.second_verify = Some(data.clone());
+        if let Some(requester) = soda.browser_requester() {
+            let _ = requester.register_second_verify(
+                token,
+                &session.session_key,
+                &data,
+                &general_params_value(session),
+            );
+        }
+        session_save(session);
+        save_state(session);
+        let mut flags = extra;
+        flags.insert("need_second_verify".to_string(), "true".to_string());
+        return Ok(QRLoginResult {
+            source: crate::model::SOURCE_SODA.to_string(),
+            key: token.to_string(),
+            status: QRLoginStatus::Scanned,
+            message: "二次验证已提交，但服务端仍要求验证，请在验证窗口重试".to_string(),
+            cookie: String::new(),
+            cookies: BTreeMap::new(),
+            extra: flags,
+        });
+    }
+
+    let confirmed = is_confirmed(&data, &raw_status);
+    if error_code != 0 && !confirmed {
+        return Err(SodaError::not_found(if description.is_empty() {
+            format!("汽水二次验证失败（{error_code}）")
+        } else {
+            description
+        }));
+    }
+    if confirmed {
+        return finish_confirmed(soda, session, token, &data, &payload, extra);
+    }
+    // 未确认也未报错：把重发期间累积的 cookie 落盘，回到常规轮询
+    session_save(session);
+    save_state(session);
+    Ok(QRLoginResult {
+        source: crate::model::SOURCE_SODA.to_string(),
+        key: token.to_string(),
+        status: QRLoginStatus::Waiting,
+        message: "验证已提交，等待汽水确认…".to_string(),
+        cookie: String::new(),
+        cookies: BTreeMap::new(),
+        extra,
+    })
+}
+
 impl Soda {
     /// 创建扫码登录二维码。
     pub fn create_qr(&self) -> Result<QrCreateResult> {
@@ -995,6 +1229,39 @@ impl Soda {
     /// 轮询扫码状态。
     pub fn check_qr(&self, token: &str) -> Result<QRLoginResult> {
         check_qr(self, token)
+    }
+
+    /// 二次验证窗口地址（用系统浏览器打开后自动加载官方验证组件）。
+    ///
+    /// 仅在 `check_qr` 返回 `need_second_verify` 后有效；地址里的 token 是
+    /// 能力凭证，随二维码会话过期自动失效。
+    pub fn second_verify_url(&self, token: &str) -> Result<String> {
+        let requester = self
+            .browser_requester()
+            .ok_or_else(|| SodaError::http("未启用签名页，无法进行二次验证（需要 CDP 签名页）"))?;
+        requester.second_verify_url(token)
+    }
+
+    /// 打开二次验证窗口，返回窗口地址。
+    ///
+    /// 首选在签名页浏览器里开**可见窗口**（同一上下文：cookie/本地 bdms/
+    /// 禁用同源策略全部对齐）；签名服务不支持时退回「地址 + 系统浏览器」。
+    pub fn open_second_verify(&self, token: &str) -> Result<String> {
+        let requester = self
+            .browser_requester()
+            .ok_or_else(|| SodaError::http("未启用签名页，无法进行二次验证（需要 CDP 签名页）"))?;
+        match requester.open_second_verify_window(token) {
+            Ok(url) => Ok(url),
+            Err(window_error) => {
+                // CDP 窗口开不出来时退回系统浏览器（决策经桥接路由领取）。
+                // 若退路也失败，上报首错（更有诊断价值）。
+                let url = requester.second_verify_url(token)?;
+                crate::util::open_system_browser(&url).map_err(|err| {
+                    SodaError::http(format!("打开验证窗口失败: {err}（{window_error}）"))
+                })?;
+                Ok(url)
+            }
+        }
     }
 }
 
@@ -1034,5 +1301,82 @@ mod rng_tests {
         let b = random_seed();
         assert!(a.iter().any(|byte| *byte != 0), "种子不该全 0");
         assert_ne!(a, b, "两次取种子不应该一样");
+    }
+
+    #[test]
+    fn session_state_round_trips_with_second_verify() {
+        let session = QrSession {
+            token: "tok".to_string(),
+            session_key: "qr-1".to_string(),
+            device_id: "1234567890123456".to_string(),
+            install_id: "123456789012345".to_string(),
+            ms_token: random_ms_token(),
+            verify_portrait_id: "uuid.login".to_string(),
+            cookie: "sessionid_ss=x".to_string(),
+            created_ms: 1,
+            last_check_ms: 2,
+            cooldown_until_ms: 3,
+            last_result: None,
+            second_verify: Some(
+                serde_json::json!({ "error_code": 2046, "biz_params": { "aid": "386088" } }),
+            ),
+        };
+        let text = serde_json::to_string(&session).expect("serialize");
+        let back: QrSession = serde_json::from_str(&text).expect("deserialize");
+        assert!(back.second_verify.is_some());
+        assert_eq!(back.cookie, session.cookie);
+
+        // 老格式状态文件（没有 second_verify 字段）仍可反序列化
+        let legacy = text.replace(",\"second_verify\":", ",\"second_verify_missing_\":");
+        let _legacy: QrSession = serde_json::from_str(&legacy).expect("legacy state");
+    }
+
+    #[test]
+    fn normalize_biz_params_accepts_all_shapes() {
+        // JSON 字符串形态（服务端常见）
+        let json_text = serde_json::json!("{\"aid\": \"386088\", \"count\": 2}");
+        assert_eq!(
+            normalize_biz_params(Some(&json_text)),
+            vec![
+                ("aid".to_string(), "386088".to_string()),
+                ("count".to_string(), "2".to_string()),
+            ]
+        );
+        // 查询串形态（含转义）
+        let query = serde_json::json!("aid=386088&scene=qr%20connect");
+        assert_eq!(
+            normalize_biz_params(Some(&query)),
+            vec![
+                ("aid".to_string(), "386088".to_string()),
+                ("scene".to_string(), "qr connect".to_string()),
+            ]
+        );
+        // 对象形态：嵌套对象序列化成 JSON 文本，null 丢弃
+        let object = serde_json::json!({ "aid": "386088", "nested": { "a": 1 }, "skip": serde_json::Value::Null });
+        let pairs = normalize_biz_params(Some(&object));
+        assert!(pairs.contains(&("aid".to_string(), "386088".to_string())));
+        assert!(pairs
+            .iter()
+            .any(|(key, value)| key == "nested" && value.contains("\"a\":1")));
+        assert!(!pairs.iter().any(|(key, _)| key == "skip"));
+        // 空形态
+        assert!(normalize_biz_params(None).is_empty());
+        assert!(normalize_biz_params(Some(&serde_json::Value::Null)).is_empty());
+        assert!(normalize_biz_params(Some(&serde_json::json!(""))).is_empty());
+    }
+
+    #[test]
+    fn confirmed_and_status_helpers() {
+        assert!(is_confirmed(&serde_json::json!({ "status": "3" }), "3"));
+        assert!(is_confirmed(&serde_json::json!({ "logged_in": true }), ""));
+        assert!(!is_confirmed(&serde_json::json!({ "status": "1" }), "1"));
+        assert_eq!(
+            status_text(&serde_json::json!({ "status": 2 })),
+            "2".to_string()
+        );
+        assert_eq!(
+            status_text(&serde_json::json!({ "status": "Scanned" })),
+            "scanned".to_string()
+        );
     }
 }

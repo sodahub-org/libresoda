@@ -5,18 +5,22 @@
 
 ## 一句话现状
 
-* ✅ **能用的部分**：创建二维码 → 手机扫码 → 确认 → 拿到会话 Cookie。
-  签名页已由 libresoda **内置 Rust CDP 实现**（`soda::cdp_signer`）：需要机器上有
+* ✅ **能用的部分**：创建二维码 → 手机扫码 → 确认 → 拿到会话 Cookie。签名页已由
+  libresoda **内置 Rust CDP 实现**（`soda::cdp_signer`）：需要机器上有
   Chrome/Chromium，**不再需要 Node**。纯 HTTP 直连护照接口会被一路 `error_code=7`
   限流，且确认后的登录态只存在于签名页浏览器会话的 cookie jar 里。
-* ⛔ **不能用的部分**：手机短信二次验证（`error_code=2046`）——当前只识别，不闭环。
+* ✅ **二次验证（`error_code=2046`）已闭环**：官方验证组件在用户浏览器打开的
+  `security_host.html` 里运行，网络请求经本地桥接路由回签名页上下文代发，
+  完成后自动带 `biz_params` 重发确认换取登录态（见下文「二次验证闭环」）。
+  纯 HTTP 短信直发（上游 Go 的 `send_code`/`validate_code` 路径）仍未移植，
+  属于可选的另一种实现。
 
 ## 涉及的文件
 
 | 部分 | 文件 | 职责 |
 | --- | --- | --- |
-| 登录流程 | `src/soda/qr_login.rs` | 会话状态、公共参数、请求头、扫码 URL、状态机、Cookie 收集 |
-| 内置签名页（默认） | `src/soda/cdp_signer.rs` | Rust 直控 Chromium（CDP）：按二维码建独立上下文、本地资产服务、`a_bogus` 校验、按域名收割 cookie |
+| 登录流程 | `src/soda/qr_login.rs` | 会话状态、公共参数、请求头、扫码 URL、状态机、Cookie 收集、二次验证决策登记与重发 |
+| 内置签名页（默认） | `src/soda/cdp_signer.rs` | Rust 直控 Chromium（CDP）：按二维码建独立上下文、本地资产+验证桥接服务、`a_bogus` 校验、按域名收割 cookie、空闲回收 |
 | 请求器抽象 | `src/soda/browser.rs` | `BrowserRequester` / `CommandRequester`（Node CLI 兼容路径） |
 | 签名提供者（可选） | `src/soda/signature.rs` | 补应用级 `X-Helios` / `X-Medusa`（`HttpSignature` / `CommandSignature` / `CapturedSignature`） |
 | 本地签名页（可选） | `tools/qishui-signer/` | Chromium + 官方 `bdms.js`，对外只暴露 `GET /health`、`POST /request` |
@@ -34,7 +38,11 @@
 **不再注入 `signature_provider` 的 `X-Helios`/`X-Medusa`**：那两个头由 libmssdk 按
 另一套设备指纹生成，套到护照请求上反而与二维码会话的 `device_id` 冲突（实测）。
 
-所以：**扫码登录目前依赖签名页**（Chromium + Node）。第 2 条路径只在服务端当前不
+`CdpSigner` 是**进程级单例**：浏览器、资产服务、二次验证登记表全进程共享，
+调用方每次轮询重建 `Soda` 也不会反复拉起 Chromium；无会话且空闲 5 分钟时自动
+关闭浏览器（下次请求重新拉起）。
+
+所以：**扫码登录目前依赖签名页**（Chromium）。第 2 条路径只在服务端当前不
 强制校验 `a_bogus` 且没触发限流时可用，属于碰运气，不要依赖。
 
 ## 会话与状态机
@@ -70,21 +78,46 @@ Meting-API `signer.js` 的做法，每个二维码一个独立 `BrowserContext`�
 挂在页面/localStorage/cookie 上，如果所有二维码共用一个页面，同一个设备身份连着开
 多个会话，很快就会一路 `error_code=7`（实测踩过）。
 
-## 手机验证码（MFA）现状 —— 重要
+## 二次验证闭环（2026-09 起）
 
-服务端要求二次验证时返回 `error_code=2046`，当前三条路径的表现：
+`check_qrconnect` 返回 `error_code=2046` 时的完整链路（对齐 Meting-API 的
+`qr.js` + `signer.js` + `security_host.html`）：
 
-| 组件 | 行为 |
-| --- | --- |
-| Rust（`qr_login::check_qr`） | 返回 `status=scanned` + `extra["need_second_verify"]="true"`，消息「请在汽水二次验证窗口中完成身份验证」，之后**继续轮询仍是同样结果** |
-| `tools/qishui-qr.py` | 不特判 2046，只打印 `status` / `error_code` 继续轮询，最终可能耗尽 attempts |
-| 签名页 `security_host.html` | 页面里**有** `__qishuiSecondVerify`（会加载官方 `ucWebSecondVerify` 组件并弹验证窗口），但它依赖 Meting-API 那套 `/admin/qr/qishui/verify/{request,start,complete}` 桥接；**本仓库没有实现这三个路由**（`signer-server.mjs` 只有 `/health`、`/request`、`/close`、`/sessions`），所以这条路径目前是死的 |
+1. `qr_login::check_qr` 把 2046 响应的 `data`（决策）存进会话，并经
+   `BrowserRequester::register_second_verify` 登记到 CDP 签名页；状态维持
+   `Scanned` + `extra["need_second_verify"]="true"`；挂起验证的会话 TTL 放宽到
+   10 分钟；
+2. 调用方（sodam）用 `soda.open_second_verify(token)` 打开验证窗口：**首选
+   在签名页浏览器里开可见窗口**（headless 浏览器重启为 headed、二维码上下文的
+   cookie 迁移注入、验证页与签名页同上下文）；签名服务不支持时退回
+   「地址 + 系统默认浏览器」；
+3. 页面自动走官方组件：`POST /verify/start` 领取决策 →（必要时）
+   `pack_verify_ways_data` 展开决策 → 动态加载官方 `ucWebSecondVerify` 组件；
+4. 组件内的全部 XHR 被 `security_host.html` 劫持，经 `POST /verify/request`
+   回到**该二维码的浏览器上下文**代发（带登录 cookie + `a_bogus`；目标域名白名单：
+   `api.qishui.com` / `auth.zijieapi.com` / `bff-pc.qishui.com`）；
+5. 组件完成 → `POST /verify/complete` 置位完成标志；
+6. 下一次 `check_qr` 轮询发现标志，带原决策的 `biz_params` + `isResend=true`
+   重发 `check_qrconnect`（`complete_second_verify`）→ 确认后
+   `finish_confirmed` 收尾发登录态；若服务端仍要求验证则刷新决策回到等待。
 
-上游 Go 的完整实现（`sodaSendCode` / `sodaVerifyUpSMS` / `sodaValidateCode` +
-`extractSodaMFA*` 字段提取，约 250 行）**尚未移植**，是 `PORTING.md` 里未移植项的第 1 条。
+约束与注意：
 
-**现在遇到 MFA 的现实做法**：在官方客户端完成二次验证，然后导出 Cookie 交给
-`Soda::new`；或者等 MFA 闭环移植完成。
+* token 就是能力凭证：`get_qrcode` 随机下发、随会话过期失效，桥接服务只监听
+  127.0.0.1，代发目标另有域名白名单；
+* 验证窗口优先开在**签名页浏览器**（headed）：同上下文意味着 cookie、本地
+  `bdms.js`、`--disable-web-security` 全部就位。系统浏览器方案存在两道缝：
+  页面只接管了 XHR（组件用 `fetch` 的请求会直撞 CORS），bdms 也只能从 CDN 拉。
+  实测踩过：验证窗口打开后签名页 Chromium 无声退出，组件的桥接请求全部
+  `receiver is gone`；因此签名页加了**自愈**（页面/浏览器通道断开时清缓存
+  重建，必要时重启浏览器）；
+* `SODA_CDP_DUMP=1` 时 Chromium 会把自身日志写进临时 profile 目录的
+  `chrome.log`，用于排查浏览器无声退出；
+* 最后一个会话关闭时会顺带回收整个浏览器（验证窗口不残留）；
+* `CommandRequester`（Node CLI 路径）未实现这套桥接（trait 默认实现返回
+  「不支持」），二次验证窗口仅内置 CDP 签名页可用；
+* 上游 Go 的纯 HTTP 短信路径（`sodaSendCode` / `sodaValidateCode`）仍未移植，
+  可作为未来「应用内输入验证码」的增强，与组件方案不冲突。
 
 ## 用法
 
@@ -184,9 +217,12 @@ Playwright 的 `context.cookies()`。
 
 ## 已知限制
 
-1. MFA 二次验证未闭环（见上）。
+1. 二次验证窗口依赖系统浏览器与内置 CDP 签名页（`CommandRequester`/Node 路径
+   不支持）；窗口关闭后可重新调用 `open_second_verify` 再次打开。
 2. passport 抓包参数回填（`SODA_QR_USE_CAPTURE_PARAMS` 那套）未移植；`CapturedSignature`
    只回填 `msToken` / `a_bogus` / 请求头，不处理查询参数。
 3. 轮询只有固定冷却，没有上游的退避/遗忘状态机，长时间轮询不如上游稳。
 4. 会话只存在内存或单个 `SODA_QR_STATE` 文件里；要多路并发得自己给每个流程分配路径。
 5. 不提供二维码本地渲染，用 `qrencode` 等外部工具画 `scan_url` 即可。
+6. 二次验证的完整链路需要真机触发 `error_code=2046` 才能验收（滑块/短信/人脸
+   由官方组件决定），离线测试只覆盖桥接路由与参数归一化。

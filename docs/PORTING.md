@@ -100,10 +100,11 @@
 
 按「会不会挡住用户」排序：
 
-1. **MFA 二次验证闭环**（`send_code` → `validate_code`，含 `upsms/verify` 兜底）。
-   现状：`check_qr` 遇到 `error_code=2046` 只返回 `extra["need_second_verify"]="true"`
-   并停在 `scanned`，没有提取 `encrypt_uid` / verify 参数，也没有提交验证码的接口。
-   上游实现约 250 行，可对拍移植。**这是唯一会卡死登录流程的缺口。**
+1. ~~**MFA 二次验证闭环**~~：✅ 已用另一条路径闭环——官方验证组件在用户浏览器
+   里运行、网络请求经本地桥接路由回签名页上下文代发，完成后带 `biz_params`
+   重发确认（详见 `QR-LOGIN.md`「二次验证闭环」）。上游的纯 HTTP 短信路径
+   （`send_code` → `validate_code`，含 `upsms/verify` 兜底，约 250 行）作为
+   可选的「应用内输码」增强仍未移植，不再阻塞登录。
 2. **passport 抓包参数回填**（`sodaLoadCapturedParams` / `applySodaCaptured*`，配
    `SODA_QR_USE_CAPTURE_PARAMS` 开关 + 抓包文件）。注意与 `signature::CapturedSignature`
    不是一回事：后者只是把抓到的 `msToken`/`a_bogus`/请求头原样回填。
