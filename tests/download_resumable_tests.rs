@@ -718,3 +718,105 @@ fn the_legacy_wrapper_keeps_a_pre_existing_target_on_failure() {
     assert!(!part(&target).exists() && !record(&target).exists() && !dec_tmp(&target).exists());
     cleanup(&dir);
 }
+
+/// 旧策略**取流就失败**时不能动盘上已有的续传暂存：这次调用一个字节都没下，那份暂存仍属于
+/// 下一次可续传调用（票 #20 第 1 条）。修复前 `discard_parts` 抢在请求之前，一次 `503` 就会
+/// 把已经下了一部分的暂存整个抹掉。
+#[test]
+fn the_legacy_wrapper_keeps_resumable_staging_when_the_stream_request_fails() {
+    let dir = sandbox("legacy-keeps-staging-on-http-error");
+    let target = target_in(&dir);
+    let play_auth = build_play_auth(&key_hex(&KEY), 3);
+    let ciphertext = encrypted_fixture();
+    let total = ciphertext.len();
+    let soda = Soda::new("");
+
+    // 先用可续传路径留下一段能接的暂存（断流）。
+    let range = format!("Content-Range: bytes 0-{}/{}", total - 1, total);
+    let (dropped_url, _) = stream_server(vec![response(
+        "206 Partial Content",
+        &[range.as_str(), "ETag: \"v1\""],
+        Some(total),
+        &ciphertext[..CUT],
+    )]);
+    soda.download_resumable(&song_for(&dropped_url, &play_auth), &target)
+        .expect_err("断流不是成功");
+    assert_eq!(part_bytes(&target).expect("留下的暂存"), ciphertext[..CUT]);
+    assert!(record(&target).is_file(), "可续传路径该留下记录");
+
+    // 旧函数这次撞上 404 / 503：请求没成功，暂存必须原样留着。
+    for (code, line) in [("404", "404 Not Found"), ("503", "503 Service Unavailable")] {
+        let (url, server) = stream_server(vec![answered(line, &[], b"no stream")]);
+        let error = soda
+            .download(&song_for(&url, &play_auth), &target)
+            .expect_err(line);
+
+        assert!(error.to_string().contains(code), "{error}");
+        assert_eq!(seen(&server).len(), 1, "旧策略只该试这一次");
+        assert_eq!(
+            part_bytes(&target).expect("失败请求抹掉了暂存"),
+            ciphertext[..CUT],
+            "{code}：取流失败时暂存不该被删"
+        );
+        assert!(record(&target).is_file(), "{code}：记录不该被删");
+        assert!(!target.exists(), "{code}：失败的调用不该产出目标文件");
+    }
+
+    // 传输层失败（连上就断、没有 HTTP 状态码）同样不该动暂存。
+    let (url, _) = stream_server(vec![Vec::new()]);
+    soda.download(&song_for(&url, &play_auth), &target)
+        .expect_err("连接断开是失败");
+    assert_eq!(
+        part_bytes(&target).expect("连接失败抹掉了暂存"),
+        ciphertext[..CUT],
+        "连接层失败时暂存不该被删"
+    );
+    assert!(record(&target).is_file(), "连接层失败时记录不该被删");
+    assert!(!target.exists(), "失败的调用不该产出目标文件");
+
+    // 连接被拒：端口上根本没有监听者。
+    let refused = {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        drop(listener);
+        format!("http://{addr}/stream")
+    };
+    soda.download(&song_for(&refused, &play_auth), &target)
+        .expect_err("连接被拒是失败");
+    assert_eq!(
+        part_bytes(&target).expect("连接被拒抹掉了暂存"),
+        ciphertext[..CUT],
+        "连接被拒时暂存不该被删"
+    );
+    assert!(record(&target).is_file(), "连接被拒时记录不该被删");
+    assert!(!target.exists(), "失败的调用不该产出目标文件");
+    cleanup(&dir);
+}
+
+/// 记录文件的原子写临时名（`{目标}.part.meta.tmp`）被目录占着时，旧策略仍要把整曲落盘：
+/// 记录写失败只该少一份缓存线索，不能把已经下完的字节一起丢掉（票 #20 第 2 条）。
+#[test]
+fn the_legacy_wrapper_downloads_the_whole_song_when_record_tmp_is_occupied() {
+    let dir = sandbox("legacy-record-tmp-blocked");
+    let target = target_in(&dir);
+    let play_auth = build_play_auth(&key_hex(&KEY), 3);
+    let ciphertext = encrypted_fixture();
+    let blocked = append(&record(&target), ".tmp");
+    std::fs::create_dir(&blocked).expect("directory in the record temp slot");
+    let (url, server) = stream_server(vec![answered("200 OK", &[], &ciphertext)]);
+
+    Soda::new("")
+        .download(&song_for(&url, &play_auth), &target)
+        .expect("记录临时名被占位不该挡住旧策略");
+
+    assert_eq!(seen(&server).len(), 1);
+    assert_eq!(
+        std::fs::read(&target).expect("输出文件"),
+        decrypt_audio_with_key(&ciphertext, &KEY).expect("batch decrypt"),
+        "整曲要照常落盘"
+    );
+    assert!(blocked.is_dir(), "不是我们的目录被删了");
+    // 记录写本来就失败、成功交付也会清掉它：这里只断数据与交付临时名不残留。
+    assert!(!part(&target).exists() && !dec_tmp(&target).exists());
+    cleanup(&dir);
+}
