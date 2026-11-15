@@ -302,8 +302,8 @@ pub fn decrypt_audio_with_key(file_data: &[u8], key_bytes: &[u8]) -> Result<Vec<
 /// * `mdat` 之前的所有顶层 box（`ftyp` / `moov` / `free` …，通常几十 KB）读进内存，
 ///   因为样本表 `stsz`、初始化向量 `senc`、`stsd` 编码改写都在 `moov` 里；
 /// * 样本位置和 `senc` 记录都按需现读，不预先展开（票 #49）；样本数仍受合计上限
-///   `MAX_PLAN_SAMPLES` 约束（票 #44）。流式路径看不到后续 mdat，总载荷未知，
-///   字节预算核对由逐段覆盖检查兜底（票 #45）；
+///   `MAX_PLAN_SAMPLES` 约束（票 #44）。每段 `mdat` 解密前先核对样本刚好铺满该段载荷
+///   （票 #45）；
 /// * `mdat` 载荷按样本大小逐块读出、解密、写出，缓冲只占一个样本（几 KB）；
 /// * 多个顶层 `mdat` 按文件顺序逐个处理（票 #45），之间的其它 box 原样透传；
 /// * 少数 `moov` 排在 `mdat` 之后的文件无法流式处理，退回整块解密，保证兼容性。
@@ -380,8 +380,8 @@ pub fn decrypt_stream<R: Read, W: Write>(
     }
 
     // 3) 从前导 box 里解出「每个样本在哪、用哪条轨的哪个 senc 样本解」。
-    //    此刻只见过第一个 mdat，总载荷长度未知：字节预算核对交给后面逐段 mdat
-    //    的覆盖检查，条目数上限在解析时已经兜住内存。
+    //    此刻只见过第一个 mdat，总载荷长度未知；铺满校验在每段 mdat 解密前完成，
+    //    样本数上限在解析时兜住游标的工作量。
     let moov = find_box(&prefix, b"moov", 0, prefix.len())
         .ok_or_else(|| SodaError::crypto("moov box not found"))?;
     let mdat_payload_start = prefix
@@ -613,9 +613,9 @@ fn plan_decryption(
 
 /// 解析所有轨的样本表，产出一份能按文件偏移现算样本位置的计划（不做覆盖核对）。
 ///
-/// `payload_budget` 是所有 mdat 载荷的合计字节数，用来在展开样本前拒绝明显装不下的
-/// 声明；流式路径传 `usize::MAX`（总载荷要等所有 mdat 都见过才知道，覆盖核对会在后面
-/// 逐段兜住）。样本位置和 `senc` 记录都不预先展开（票 #49），内存只跟 `moov` 里的表
+/// `payload_budget` 是所有 mdat 载荷的合计字节数：先按声明的样本字节数早拒明显装不下的
+/// 文件；流式路径传 `usize::MAX`（后续 mdat 还没读到），铺满校验在每段 mdat 解密前逐段做。
+/// 样本位置和 `senc` 记录都不预先展开（票 #49），内存只跟 `moov` 里的表
 /// 大小和轨数有关；声明样本总数仍受 `MAX_PLAN_SAMPLES` 兜底（票 #44）。
 ///
 /// 上游没有这条多轨计划；票 #42 新增，票 #45 从 `plan_decryption` 拆出。
@@ -920,13 +920,13 @@ impl<'plan> TrackSamples<'plan> {
 
 /// 多条轨的样本按文件偏移归并：每次只算「各轨当前的下一个样本」，不落全量列表。
 ///
-/// 归并按（偏移, 轨序号）排序，与旧实现「全量收集后按偏移排序」对同位样本的先后不敏感
-/// ——同位只可能是 0 字节样本，先写谁都不产出字节。堆里每条轨只放一个当前样本，
+/// 归并按（偏移, 尺寸, 轨序号）排序：同偏移时 0 字节样本先出，不会因为先写了同起点的
+/// 非零样本，把别的轨的 0 字节样本挤到游标后面。堆里每条轨只放一个当前样本，
 /// 取下一个是 O(log 轨数)，不会每个样本扫一遍所有轨。
 #[derive(Clone)]
 struct SampleWalk<'plan> {
     cursors: Vec<TrackSamples<'plan>>,
-    /// 各轨当前样本的最小堆，键是（偏移, 轨序号, 尺寸）。
+    /// 各轨当前样本的最小堆，键是（偏移, 尺寸, 轨序号）。
     heap: BinaryHeap<Reverse<(usize, usize, usize)>>,
 }
 
@@ -935,7 +935,7 @@ impl<'plan> SampleWalk<'plan> {
         let mut heap = BinaryHeap::with_capacity(cursors.len());
         for cursor in cursors.iter_mut() {
             if let Some(sample) = cursor.next()? {
-                heap.push(Reverse((sample.offset, sample.track, sample.size)));
+                heap.push(Reverse((sample.offset, sample.size, sample.track)));
             }
         }
         Ok(SampleWalk { cursors, heap })
@@ -945,7 +945,7 @@ impl<'plan> SampleWalk<'plan> {
     fn peek(&self) -> Option<PlannedSample> {
         self.heap
             .peek()
-            .map(|Reverse((offset, track, size))| PlannedSample {
+            .map(|Reverse((offset, size, track))| PlannedSample {
                 offset: *offset,
                 size: *size,
                 track: *track,
@@ -954,12 +954,12 @@ impl<'plan> SampleWalk<'plan> {
 
     /// 消费当前最靠前的样本，并把那条轨推进一个。
     fn advance(&mut self) -> Result<Option<PlannedSample>> {
-        let Some(Reverse((offset, track, size))) = self.heap.pop() else {
+        let Some(Reverse((offset, size, track))) = self.heap.pop() else {
             return Ok(None);
         };
         if let Some(next) = self.cursors[track].next()? {
             self.heap
-                .push(Reverse((next.offset, next.track, next.size)));
+                .push(Reverse((next.offset, next.size, next.track)));
         }
         Ok(Some(PlannedSample {
             offset,
