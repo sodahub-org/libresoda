@@ -1318,6 +1318,74 @@ fn decrypt_passes_through_trailing_size_zero_mdat() {
     assert_eq!(out, decrypted);
 }
 
+/// 尾部 size-0 mdat 不被识别，但有样本指向它时按损坏拒绝。
+#[test]
+fn decrypt_rejects_samples_pointing_into_size_zero_mdat() {
+    let (mut file, _, _) = two_mdat_fixture(false, &[], false, false);
+    let tail_start = file.len() as u32;
+    file.extend_from_slice(&0u32.to_be_bytes());
+    file.extend_from_slice(b"mdat");
+    file.extend_from_slice(&[0xEEu8; 8]);
+    // 把文字轨第一个 chunk 偏移指进 size-0 mdat 的载荷
+    let audio_stco = find_box_deep(&file, b"stco", 0, file.len()).expect("音频 stco");
+    let text_stco = find_box_deep(
+        &file,
+        b"stco",
+        audio_stco.offset + audio_stco.size,
+        file.len(),
+    )
+    .expect("文字 stco");
+    let entry = text_stco.offset + 16;
+    file[entry..entry + 4].copy_from_slice(&(tail_start + 8).to_be_bytes());
+
+    let err = decrypt_audio_with_key(&file, &KEY).expect_err("整块应拒绝");
+    assert!(err.to_string().contains("decrypted size mismatch"), "{err}");
+    let mut input = Dribble {
+        data: &file,
+        pos: 0,
+        step: 5,
+    };
+    let mut out = Vec::new();
+    let err = decrypt_stream(&mut input, &KEY, &mut out).expect_err("流式应拒绝");
+    assert!(err.to_string().contains("decrypted size mismatch"), "{err}");
+}
+
+/// 尾部不够一个 box 头（或 64 位加长头只有一半 ext）：两条路径都原样透传。
+#[test]
+fn decrypt_passes_through_partial_trailing_headers() {
+    let (file, _, _) = two_mdat_fixture(false, &[], false, false);
+
+    // 不足 8 字节：不够一个 box 头
+    let mut short_tail = file.clone();
+    short_tail.extend_from_slice(&[0xAAu8; 3]);
+    let expected = decrypt_audio_with_key(&short_tail, &KEY).expect("整块应成功");
+    assert!(expected.ends_with(&[0xAAu8; 3]));
+    let mut input = Dribble {
+        data: &short_tail,
+        pos: 0,
+        step: 7,
+    };
+    let mut out = Vec::new();
+    decrypt_stream(&mut input, &KEY, &mut out).expect("流式应成功");
+    assert_eq!(out, expected);
+
+    // 64 位加长头只读到一半 ext
+    let mut half_ext = file.clone();
+    half_ext.extend_from_slice(&1u32.to_be_bytes());
+    half_ext.extend_from_slice(b"free");
+    half_ext.extend_from_slice(&[0xBBu8; 4]);
+    let expected = decrypt_audio_with_key(&half_ext, &KEY).expect("整块应成功");
+    assert!(expected.ends_with(&[0xBBu8; 4]));
+    let mut input = Dribble {
+        data: &half_ext,
+        pos: 0,
+        step: 7,
+    };
+    let mut out = Vec::new();
+    decrypt_stream(&mut input, &KEY, &mut out).expect("流式应成功");
+    assert_eq!(out, expected);
+}
+
 /// 64 位加长头 box 排在 moov 之前：moov 定位只认 32 位头，两条路径同口径拒绝。
 /// 单 mdat 时代就有的限制，钉住奇偶性。
 #[test]

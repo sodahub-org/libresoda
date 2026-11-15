@@ -669,6 +669,8 @@ fn plan_track_samples(
 ///
 /// 铺不满、越过边界、指向这段之前，都按损坏报错：没认出来的字节可能是密文，
 /// 不能原样透传（票 #42 的口径，票 #45 推广到每一段 mdat）。
+///
+/// 上游没有这个辅助；票 #45 新增。
 fn cover_mdat_payload(
     samples: &[PlannedSample],
     next: &mut usize,
