@@ -121,10 +121,10 @@
   `size==0`（延伸到文件尾）的尾部 `mdat` 不被识别，没有样本指向它时原样透传（与旧版对尾部
   box 的处理一致，有用例钉住），有样本指向它时按损坏拒绝；整块路径顺带认了 64 位头的非
   `mdat` box，旧版会报 `mdat box not found`，属放宽不是回归。流式路径的字节预算传
-  `usize::MAX`（总载荷要等所有 `mdat` 见过才知道），位置表只受 `MAX_SAMPLE_ENTRIES` 兜底：
-  构造小文件声明 4M 个单字节样本时最坏约 208 MiB 瞬态分配，整块路径仍在展开位置表前按载荷
-  拒绝；结构修复（chunk 级惰性展开）见
-  [`sodahub-org/libresoda#49`](https://github.com/sodahub-org/libresoda/issues/49)。
+  `usize::MAX`（总载荷要等所有 `mdat` 见过才知道），样本数仍受计划阶段的合计上限
+  `MAX_PLAN_SAMPLES`（1M）兜底（票 #44）：声明超过 1M 条样本的畸形文件直接报
+  `sample table is unreasonably large`，最坏元数据约 120MB；结构修复（chunk 级惰性展开）
+  见 [`sodahub-org/libresoda#49`](https://github.com/sodahub-org/libresoda/issues/49)。
 
 * **解密计划的样本上限（`crypto::plan_decryption`，票 #44）**：计划阶段把每个样本的尺寸、
   位置、`senc` 记录都落内存，64 位下约 100 字节/样本。沿用解析上限 `MAX_SAMPLE_ENTRIES`（4M）
