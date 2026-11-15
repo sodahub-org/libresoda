@@ -348,6 +348,8 @@ pub fn decrypt_stream<R: Read, W: Write>(
 }
 
 /// 按计划把一段样本从输入读出、解密（没有 `senc` 的原样透传）、写出。
+///
+/// 上游没有这个辅助；票 #45 新增。
 fn write_samples<R: Read, W: Write>(
     input: &mut R,
     out: &mut W,
@@ -375,6 +377,8 @@ fn write_samples<R: Read, W: Write>(
 }
 
 /// 写出 box 头（64 位加长头时多写 8 字节 ext）。
+///
+/// 上游没有这个辅助；票 #45 新增。
 fn write_box_header<W: Write>(out: &mut W, head: &[u8; 8], ext: Option<[u8; 8]>) -> Result<()> {
     out.write_all(head)
         .map_err(|err| SodaError::crypto(format!("write failed: {err}")))?;
@@ -386,6 +390,8 @@ fn write_box_header<W: Write>(out: &mut W, head: &[u8; 8], ext: Option<[u8; 8]>)
 }
 
 /// 尽量读满 `buf`；碰到 EOF 返回已读字节数，不报错。
+///
+/// 上游没有这个辅助；票 #45 新增。
 fn read_up_to<R: Read>(input: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
     let mut filled = 0usize;
     while filled < buf.len() {
@@ -698,6 +704,8 @@ fn cover_mdat_payload(
 ///
 /// 认 64 位加长头：流式路径本来就认，整块路径不认的话，
 /// 两条路径会对同一个文件给出两种结果。
+///
+/// 上游没有这个辅助；票 #45 新增。
 fn top_level_mdats(data: &[u8]) -> Vec<(usize, usize)> {
     let mut mdats = Vec::new();
     let mut pos = 0usize;

@@ -723,7 +723,8 @@ fn build_multi_mdat_mp4(
     file
 }
 
-/// 票 #45 验收素材：音频 3 个样本全在第一个 mdat，文字 2 个样本在第二个 mdat。
+/// 票 #45 验收素材：音频 3 个样本全在第一个 mdat（前两块各装 2 个、最后一块装 1 个），
+/// 文字 2 个样本在第二个 mdat（同一个 chunk）。
 /// 返回（文件, 第一个 mdat 的明文, 第二个 mdat 的明文）。
 fn two_mdat_fixture(
     use_co64: bool,
@@ -763,8 +764,9 @@ fn two_mdat_fixture(
         (FixtureTrack::Text, 1),
         (FixtureTrack::Text, 1),
     ];
-    let audio_stsc = [(1u32, 1u32)];
-    let text_stsc = [(1u32, 1u32)];
+    // 音频前两个样本一个 chunk、最后一个单独一块；文字两个样本同一个 chunk
+    let audio_stsc = [(1u32, 2u32), (3u32, 1u32)];
+    let text_stsc = [(1u32, 2u32)];
     let audio = TrackFixture {
         sizes: &audio_sizes,
         senc: Some(&senc_payload),
@@ -1140,10 +1142,10 @@ fn decrypt_rejects_truncated_second_mdat() {
         step: 5,
     };
     let mut out = Vec::new();
-    assert!(
-        decrypt_stream(&mut input, &KEY, &mut out).is_err(),
-        "流式解密应拒绝截断的第二个 mdat"
-    );
+    // 流式的覆盖核对是纯算术，截断要到读样本时才暴露，文案与整块不同
+    let err =
+        decrypt_stream(&mut input, &KEY, &mut out).expect_err("流式解密应拒绝截断的第二个 mdat");
+    assert!(err.to_string().contains("read mdat failed"), "{err}");
 }
 
 /// moov 排在两个 mdat 之后：流式退回整块，整块也要认得多 mdat。
@@ -1271,6 +1273,24 @@ fn decrypt_rejects_sample_pointing_into_free_box() {
     let err =
         decrypt_stream(&mut input, &KEY, &mut out).expect_err("流式解密应拒绝指进 free box 的样本");
     assert!(err.to_string().contains("decrypted size mismatch"), "{err}");
+}
+
+/// 64 位头 mdat 且 moov 后置：moov 定位只认 32 位头，两条路径同口径拒绝。
+/// 这是单 mdat 时代就有的限制，钉住两条路径的奇偶性。
+#[test]
+fn decrypt_rejects_64bit_mdat_when_moov_follows() {
+    let (file, _, _) = two_mdat_fixture(false, &[], true, true);
+
+    let err = decrypt_audio_with_key(&file, &KEY).expect_err("整块应拒绝");
+    assert!(err.to_string().contains("moov box not found"), "{err}");
+    let mut input = Dribble {
+        data: &file,
+        pos: 0,
+        step: 5,
+    };
+    let mut out = Vec::new();
+    let err = decrypt_stream(&mut input, &KEY, &mut out).expect_err("流式应拒绝");
+    assert!(err.to_string().contains("moov box not found"), "{err}");
 }
 
 /// 缺表的多 mdat 即使第二个 mdat 是空载荷也要拒绝：老口径推不出布局。
