@@ -115,7 +115,8 @@
   一次 IV 堆分配，占近一半）。计划阶段单独设更紧的 `MAX_PLAN_SAMPLES`（1M，所有轨合计），
   把最坏元数据压到约 120MB；`stsc`/`stco`/`co64` 的单张表条目数也夹到这个上限（chunk 数不会
   超过样本数；表本身还受实际数据长度约束）。取舍：1M 约够 6 小时音频（48kHz AAC），正常曲目
-  只有几千到几万条，不受影响；超过上限的畸形文件报 `sample table is unreasonably large`。
+  只有几千到几万条，不受影响；样本数超上限的畸形文件报 `sample table is unreasonably large`，
+  chunk 表条目超限或表本身对不上时报 `invalid sample table`。
   公开的独立解析函数（`parse_stsz`/`parse_senc`）仍用 4M，公开口径不变；计划阶段的表解析统一
   用 1M。`planned` 改用 `with_capacity` 一次性分配，去掉翻倍扩容时旧新两份并存的瞬态。按 chunk
   流式展开（彻底去掉 O(样本数) 元数据）是更大的重构，另见规划票 #46，不在本票范围。

@@ -1169,7 +1169,7 @@ mod tests {
         assert!(parse_stsz_limited(&data, MAX_PLAN_SAMPLES).is_none());
     }
 
-    /// 票 #44：chunk 表条目数也受计划上限约束——数据装得下但声明超过上限时拒绝。
+    /// 票 #44：chunk 表条目数受传入上限约束——数据装得下但声明超过上限时拒绝。
     #[test]
     fn table_entry_count_rejects_over_plan_cap() {
         let mut data = vec![0u8; 8 + (MAX_PLAN_SAMPLES + 1) * 4];
@@ -1180,5 +1180,10 @@ mod tests {
             table_entry_count(&data, 4, MAX_PLAN_SAMPLES),
             Some(MAX_PLAN_SAMPLES)
         );
+
+        // 上限是参数：换一个更小的预算同样生效，不是写死在函数里。
+        data[4..8].copy_from_slice(&10u32.to_be_bytes());
+        assert_eq!(table_entry_count(&data, 4, 5), None);
+        assert_eq!(table_entry_count(&data, 4, 10), Some(10));
     }
 }
