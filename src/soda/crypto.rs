@@ -461,7 +461,8 @@ fn plan_decryption(
 ///
 /// `payload_budget` 是所有 mdat 载荷的合计字节数，用来在分配位置表之前拒绝
 /// 明显装不下的声明；流式路径传 `usize::MAX`（总载荷要等所有 mdat 都见过才知道，
-/// 覆盖核对会在后面逐段兜住）。条目数上限不受影响，内存仍然有界。
+/// 覆盖核对会在后面逐段兜住）。条目数上限不受影响，内存仍然有界；放大上限与
+/// chunk 级惰性展开的改进见 sodahub-org/libresoda#49。
 ///
 /// 上游没有这条多轨计划；票 #42 新增，票 #45 从 `plan_decryption` 拆出。
 fn plan_track_samples(

@@ -120,7 +120,11 @@
   的文件两条路径都按 `moov box not found` 拒绝（与单 `mdat` 时一致，有用例钉住）；
   `size==0`（延伸到文件尾）的尾部 `mdat` 不被识别，没有样本指向它时原样透传（与旧版对尾部
   box 的处理一致，有用例钉住），有样本指向它时按损坏拒绝；整块路径顺带认了 64 位头的非
-  `mdat` box，旧版会报 `mdat box not found`，属放宽不是回归。
+  `mdat` box，旧版会报 `mdat box not found`，属放宽不是回归。流式路径的字节预算传
+  `usize::MAX`（总载荷要等所有 `mdat` 见过才知道），位置表只受 `MAX_SAMPLE_ENTRIES` 兜底：
+  构造小文件声明 4M 个单字节样本时最坏约 208 MiB 瞬态分配，整块路径仍在展开位置表前按载荷
+  拒绝；结构修复（chunk 级惰性展开）见
+  [`sodahub-org/libresoda#49`](https://github.com/sodahub-org/libresoda/issues/49)。
 
 * **断点续传的判据（`soda::resume`，上游无对应）**：判断函数与 `Content-Range` 解析都只做
   纯计算，不碰网络与磁盘；`pub(crate)` 不对外，因为公开它等于对判断规则做出承诺
