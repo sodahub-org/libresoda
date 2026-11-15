@@ -61,7 +61,7 @@ fn mp4_box(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
 fn senc_payload(count: u32) -> Vec<u8> {
     let mut senc = vec![0u8; 8 + (count as usize) * 8];
     senc[4..8].copy_from_slice(&count.to_be_bytes());
-    for chunk in senc[8..].chunks_exact_mut(8) {
+    for chunk in senc[8..].as_chunks_mut::<8>().0 {
         chunk.copy_from_slice(&[1u8; 8]);
     }
     senc

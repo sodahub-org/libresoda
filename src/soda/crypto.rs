@@ -1637,7 +1637,7 @@ fn read_senc_record(
         // 不拿文件里的 u16 计数直接预分配。
         let table = data.get(count_end..next)?;
         subsamples.reserve(table.len() / 6);
-        for chunk in table.chunks_exact(6) {
+        for chunk in table.as_chunks::<6>().0 {
             subsamples.push(SencSubsample {
                 clear: u16::from_be_bytes([chunk[0], chunk[1]]),
                 encrypted: u32::from_be_bytes([chunk[2], chunk[3], chunk[4], chunk[5]]),
