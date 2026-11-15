@@ -682,7 +682,9 @@ fn cover_mdat_payload(
         .ok_or_else(|| SodaError::crypto("mdat size overflow"))?;
     let mut cursor = payload_start;
     while let Some(sample) = samples.get(*next) {
-        if sample.offset >= payload_end {
+        // 正好落在载荷末尾的 0 字节样本归当前段所有（stsz 允许 0 尺寸）；
+        // 真正越过末尾才交给下一段。
+        if sample.offset > payload_end {
             break;
         }
         if sample.size > MAX_SAMPLE_BYTES {

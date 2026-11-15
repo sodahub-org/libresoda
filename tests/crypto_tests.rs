@@ -1659,6 +1659,44 @@ fn decrypt_handles_single_audio_track_with_chunk_offsets() {
     }
 }
 
+/// 尾部 0 字节样本（stsz 允许 0 尺寸）：偏移正好等于载荷末尾，应归当前 mdat 所有，
+/// 不能当成损坏拒绝（票 #45 回归，改动前基线接受这种文件）。
+#[test]
+fn decrypt_handles_trailing_zero_size_sample() {
+    for use_co64 in [false, true] {
+        let ivs: [[u8; 8]; 2] = [[91; 8], [92; 8]];
+        let plain: Vec<u8> = (0..24u8).collect();
+        let sizes: Vec<u32> = vec![24, 0];
+        let senc_payload = senc_payload_for(&ivs);
+        let payload = ctr_apply(&plain, &ivs[0]);
+        let stsc = [(1u32, 1u32)];
+        let track = TrackFixture {
+            sizes: &sizes,
+            senc: Some(&senc_payload),
+            stsc: &stsc,
+        };
+        let file = build_single_track_mp4(&track, &payload, 0, use_co64);
+
+        let decrypted = decrypt_audio_with_key(&file, &KEY).expect("尾部 0 字节样本应能整块解密");
+        let mdat = find_box(&decrypted, b"mdat", 0, decrypted.len()).expect("mdat");
+        assert_eq!(mdat.data, plain.as_slice(), "use_co64={use_co64}");
+
+        for step in [1usize, 5, 4096] {
+            let mut input = Dribble {
+                data: &file,
+                pos: 0,
+                step,
+            };
+            let mut out = Vec::new();
+            decrypt_stream(&mut input, &KEY, &mut out).expect("流式解密应成功");
+            assert_eq!(
+                out, decrypted,
+                "use_co64={use_co64}, step={step} 时流式输出应与整块解密一致"
+            );
+        }
+    }
+}
+
 /// mdat 末尾有没被任何轨样本覆盖的字节时，不能原样透传当成功。
 #[test]
 fn decrypt_rejects_unaccounted_mdat_bytes() {
