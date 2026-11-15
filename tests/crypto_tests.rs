@@ -1293,6 +1293,75 @@ fn decrypt_rejects_64bit_mdat_when_moov_follows() {
     assert!(err.to_string().contains("moov box not found"), "{err}");
 }
 
+/// 尾部 size==0（延伸到文件尾）的 mdat 不被识别：没有样本指向它时原样透传，
+/// 与旧版对尾部 box 的处理一致，两条路径必须一致。
+#[test]
+fn decrypt_passes_through_trailing_size_zero_mdat() {
+    let (file, _, _) = two_mdat_fixture(false, &[], false, false);
+    let mut with_tail = file.clone();
+    with_tail.extend_from_slice(&0u32.to_be_bytes());
+    with_tail.extend_from_slice(b"mdat");
+    with_tail.extend_from_slice(&[0xEEu8; 8]);
+
+    let decrypted = decrypt_audio_with_key(&with_tail, &KEY).expect("整块解密应成功");
+    assert!(
+        decrypted.ends_with(&[0xEEu8; 8]),
+        "没认出来的尾部字节应原样透传"
+    );
+    let mut input = Dribble {
+        data: &with_tail,
+        pos: 0,
+        step: 7,
+    };
+    let mut out = Vec::new();
+    decrypt_stream(&mut input, &KEY, &mut out).expect("流式解密应成功");
+    assert_eq!(out, decrypted);
+}
+
+/// 64 位加长头 box 排在 moov 之前：moov 定位只认 32 位头，两条路径同口径拒绝。
+/// 单 mdat 时代就有的限制，钉住奇偶性。
+#[test]
+fn decrypt_rejects_64bit_box_before_moov() {
+    let (file, _, _) = two_mdat_fixture(false, &[], false, false);
+    let ftyp = find_box(&file, b"ftyp", 0, file.len()).expect("ftyp");
+    let front_end = ftyp.offset + ftyp.size;
+    let free = mp4_box_largesize(b"free", &[0u8; 8]);
+    let delta = free.len() as u32;
+
+    // 在 ftyp 后插一个 64 位头 free，所有 stco 条目加上它的长度，保持文件其余部分合法
+    let mut shifted = file[front_end..].to_vec();
+    let mut search_from = 0usize;
+    while let Some(stco) = find_box_deep(&shifted, b"stco", search_from, shifted.len()) {
+        let stco_offset = stco.offset;
+        let stco_size = stco.size;
+        let count = u32::from_be_bytes(
+            shifted[stco_offset + 12..stco_offset + 16]
+                .try_into()
+                .expect("条目数"),
+        ) as usize;
+        for index in 0..count {
+            let entry = stco_offset + 16 + index * 4;
+            let value = u32::from_be_bytes(shifted[entry..entry + 4].try_into().expect("偏移"));
+            shifted[entry..entry + 4].copy_from_slice(&(value + delta).to_be_bytes());
+        }
+        search_from = stco_offset + stco_size;
+    }
+    let mut rebuilt = file[..front_end].to_vec();
+    rebuilt.extend_from_slice(&free);
+    rebuilt.extend_from_slice(&shifted);
+
+    let err = decrypt_audio_with_key(&rebuilt, &KEY).expect_err("整块应拒绝");
+    assert!(err.to_string().contains("moov box not found"), "{err}");
+    let mut input = Dribble {
+        data: &rebuilt,
+        pos: 0,
+        step: 5,
+    };
+    let mut out = Vec::new();
+    let err = decrypt_stream(&mut input, &KEY, &mut out).expect_err("流式应拒绝");
+    assert!(err.to_string().contains("moov box not found"), "{err}");
+}
+
 /// 缺表的多 mdat 即使第二个 mdat 是空载荷也要拒绝：老口径推不出布局。
 #[test]
 fn decrypt_rejects_legacy_layout_with_empty_second_mdat() {

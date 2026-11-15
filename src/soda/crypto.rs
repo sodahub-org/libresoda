@@ -146,13 +146,15 @@ pub fn decrypt_audio_with_key(file_data: &[u8], key_bytes: &[u8]) -> Result<Vec<
     Ok(decrypted_data)
 }
 
-/// 流式解密：边读边解边写，峰值内存只与「单个样本」和「mdat 之前的 box」有关。
+/// 流式解密：边读边解边写，峰值内存主要由「单个样本」和「mdat 之前的 box」决定。
 ///
 /// 与 [`decrypt_audio_with_key`] 的输出**逐字节一致**，区别只是不再把整首
 /// （无损 40~80MB）连同解密副本一起放进内存：
 ///
 /// * `mdat` 之前的所有顶层 box（`ftyp` / `moov` / `free` …，通常几十 KB）读进内存，
 ///   因为样本表 `stsz`、初始化向量 `senc`、`stsd` 编码改写都在 `moov` 里；
+/// * 样本位置表受条目数上限 `MAX_SAMPLE_ENTRIES` 约束；流式路径看不到后续 mdat，
+///   总载荷未知，字节预算核对由逐段覆盖检查兜底（票 #45）；
 /// * `mdat` 载荷按样本大小逐块读出、解密、写出，缓冲只占一个样本（几 KB）；
 /// * 多个顶层 `mdat` 按文件顺序逐个处理（票 #45），之间的其它 box 原样透传；
 /// * 少数 `moov` 排在 `mdat` 之后的文件无法流式处理，退回整块解密，保证兼容性。
@@ -460,6 +462,8 @@ fn plan_decryption(
 /// `payload_budget` 是所有 mdat 载荷的合计字节数，用来在分配位置表之前拒绝
 /// 明显装不下的声明；流式路径传 `usize::MAX`（总载荷要等所有 mdat 都见过才知道，
 /// 覆盖核对会在后面逐段兜住）。条目数上限不受影响，内存仍然有界。
+///
+/// 上游没有这条多轨计划；票 #42 新增，票 #45 从 `plan_decryption` 拆出。
 fn plan_track_samples(
     data: &[u8],
     moov: &Mp4Box<'_>,
