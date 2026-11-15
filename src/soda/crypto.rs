@@ -912,7 +912,7 @@ impl HeapSample {
         }
     }
 
-    fn to_planned(&self) -> PlannedSample {
+    fn to_planned(self) -> PlannedSample {
         PlannedSample {
             offset: self.offset,
             size: self.size,
