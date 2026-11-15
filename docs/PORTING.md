@@ -120,11 +120,11 @@
   的文件两条路径都按 `moov box not found` 拒绝（与单 `mdat` 时一致，有用例钉住）；
   `size==0`（延伸到文件尾）的尾部 `mdat` 不被识别，没有样本指向它时原样透传（与旧版对尾部
   box 的处理一致，有用例钉住），有样本指向它时按损坏拒绝；整块路径顺带认了 64 位头的非
-  `mdat` box，旧版会报 `mdat box not found`，属放宽不是回归。流式路径的字节预算传
-  `usize::MAX`（总载荷要等所有 `mdat` 见过才知道），由逐段覆盖核对兜底；样本位置和
-  `senc` 记录都不预先展开（票 #49，见下一条）。总样本数仍受计划阶段的合计上限
-  `MAX_PLAN_SAMPLES`（1M）兜底（票 #44）：声明超过 1M 条样本的畸形文件直接报
-  `sample table is unreasonably large`。
+  `mdat` box，旧版会报 `mdat box not found`，属放宽不是回归。流式路径在计划阶段看不到
+  后续 `mdat` 的载荷（还没读到），所以字节预算不参与早拒，铺满校验在每段 `mdat` 解密前
+  逐段完成；样本位置和 `senc` 记录都不预先展开（票 #49，见下一条），计划阶段的内存只跟
+  `moov` 里的表大小和轨数有关。总样本数仍受 `MAX_PLAN_SAMPLES`（1M）兜底（票 #44）：
+  声明超过 1M 条样本的畸形文件直接报 `sample table is unreasonably large`。
 
 * **解密计划改成惰性展开（`crypto::{plan_decryption, plan_track_samples}`，票 #49）**：
   旧实现把每条轨的 `sizes`（4 字节/样本）、`(偏移, 尺寸)` 位置表（16 字节/样本）和
@@ -138,9 +138,10 @@
   计划、输出逐字节一致。`MAX_PLAN_SAMPLES`（1M，票 #44）保留，作用变成限制游标走一遍的
   工作量，不再是内存上限（1M 约够 6 小时音频，正常曲目只有几千到几万条，不受影响；
   公开的独立解析函数 `parse_stsz`/`parse_senc` 仍用 4M，公开口径不变）。计划建好后会先空跑
-  一遍游标，表不自洽（chunk 号越界、
-  `samples_per_chunk` 为 0、样本数对不上、chunk 表多出来、偏移溢出）照旧报
-  `invalid sample table`；`stsz` 条目数超限报 `sample table is unreasonably large`。
+  一遍游标，表不自洽（chunk 号越界、`samples_per_chunk` 为 0、样本数对不上、chunk 表多出来、
+  偏移溢出）照旧报 `invalid sample table`；`stsz` 条目数超限报
+  `sample table is unreasonably large`。表校验统一在计划建好后做：同一个文件同时有多处
+  损坏时，报错种类可能与旧版不同（旧版逐轨边解析边报），单处损坏的文案不变。
   **行为变化**：同一条轨的样本偏移必须单调不减。旧实现先全量收集再按偏移排序，`stco`
   偏移倒退的表可能被排正后解出来；现在归并前就按 `invalid sample table` 拒绝（真实
   muxer 不会产出这种表）。全量展开的 `table_sample_locations` 只留在测试里当对照。

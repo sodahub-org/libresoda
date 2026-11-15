@@ -50,13 +50,12 @@ const MAX_PREFIX_BYTES: usize = 8 * 1024 * 1024;
 /// 实际只有几 KB 到几百 KB，32MB 已经非常宽裕。
 const MAX_SAMPLE_BYTES: usize = 32 * 1024 * 1024;
 
-/// 一个样本在文件里的位置，以及它属于哪条轨、是这条轨的第几个样本。
+/// 一个样本在文件里的位置和所属的轨。
 #[derive(Debug, Clone, Copy)]
 struct PlannedSample {
     offset: usize,
     size: usize,
     track: usize,
-    index: usize,
 }
 
 /// 一条轨的样本尺寸表：只记表在哪、有多少条，不按样本数展开（票 #49）。
@@ -100,6 +99,25 @@ impl SampleSizes {
                 Some(u32::from_be_bytes(bytes.try_into().ok()?) as usize)
             }
         }
+    }
+
+    /// 全部样本的字节总和；只做加法，不按样本数分配（票 #49）。
+    fn total_bytes(&self) -> Result<usize> {
+        if let SampleSizes::Fixed { size, count } = self {
+            return (*size as usize)
+                .checked_mul(*count)
+                .ok_or_else(|| SodaError::crypto("sample size overflow"));
+        }
+        let mut total = 0usize;
+        for index in 0..self.len() {
+            let size = self
+                .get(index)
+                .ok_or_else(|| SodaError::crypto("invalid sample table"))?;
+            total = total
+                .checked_add(size)
+                .ok_or_else(|| SodaError::crypto("sample size overflow"))?;
+        }
+        Ok(total)
     }
 }
 
@@ -178,8 +196,6 @@ struct DecryptPlan {
     tracks: Vec<TrackPlan>,
     /// 走了「无表首尾相接」的老口径。多 mdat 时这种布局推不出来，要显式拒绝。
     legacy_layout: bool,
-    /// 老口径的铺放起点（第一个 `mdat` 的载荷起点）。
-    first_payload_start: usize,
 }
 
 /// `stsc` 的一条记录：从 `first_chunk` 起，每个 chunk 装 `samples_per_chunk` 个样本。
@@ -662,7 +678,7 @@ fn plan_track_samples(
         let sizes = parse_stsz_layout(stsz.data, remaining_samples)
             .ok_or_else(|| SodaError::crypto("sample table is unreasonably large"))?;
         total_samples += sizes.len();
-        let track_bytes = sample_bytes_total(&sizes)?;
+        let track_bytes = sizes.total_bytes()?;
         total_sample_bytes = total_sample_bytes
             .checked_add(track_bytes)
             .ok_or_else(|| SodaError::crypto("sample size overflow"))?;
@@ -764,7 +780,7 @@ fn plan_track_samples(
         } else if any_without_tables {
             let start = legacy_cursor;
             legacy_cursor = legacy_cursor
-                .checked_add(sample_bytes_total(&track.sizes)?)
+                .checked_add(track.sizes.total_bytes()?)
                 .ok_or_else(|| SodaError::crypto("sample size overflow"))?;
             TrackLayout::Legacy { start }
         } else {
@@ -784,7 +800,6 @@ fn plan_track_samples(
     let plan = DecryptPlan {
         tracks: plans,
         legacy_layout: any_without_tables,
-        first_payload_start,
     };
     // 先把游标完整走一遍：表不自洽、偏移溢出、偏移倒退都在这里按损坏拒绝。
     // 这一步不按样本数分配任何东西（票 #49）。
@@ -874,9 +889,10 @@ impl<'plan> TrackSamples<'plan> {
                     self.left = entry.samples_per_chunk;
                 }
                 let offset = self.offset;
+                // 与旧的全量展开同口径：偏移加尺寸溢出按表不自洽处理，不报样本尺寸溢出。
                 self.offset = offset
                     .checked_add(size)
-                    .ok_or_else(|| SodaError::crypto("sample size overflow"))?;
+                    .ok_or_else(|| SodaError::crypto("invalid sample table"))?;
                 self.left -= 1;
                 offset
             }
@@ -885,13 +901,11 @@ impl<'plan> TrackSamples<'plan> {
             return Err(SodaError::crypto("invalid sample table"));
         }
         self.last_offset = offset;
-        let index = self.next_index;
         self.next_index += 1;
         Ok(Some(PlannedSample {
             offset,
             size,
             track: self.track,
-            index,
         }))
     }
 
@@ -1523,30 +1537,13 @@ fn parse_stsz_layout(data: &[u8], max_samples: usize) -> Option<SampleSizes> {
             count: effective,
         }
     } else {
+        // 只复制尺寸表本身（12 字节头 + 4 字节/条），box 后面的填充不跟着进内存。
+        let table_end = 12 + effective * 4;
         SampleSizes::Variable {
-            data: data.to_vec(),
+            data: data.get(..table_end)?.to_vec(),
             count: effective,
         }
     })
-}
-
-/// 尺寸表的字节总和；只做加法，不按样本数分配（票 #49）。
-fn sample_bytes_total(sizes: &SampleSizes) -> Result<usize> {
-    if let SampleSizes::Fixed { size, count } = sizes {
-        return (*size as usize)
-            .checked_mul(*count)
-            .ok_or_else(|| SodaError::crypto("sample size overflow"));
-    }
-    let mut total = 0usize;
-    for index in 0..sizes.len() {
-        let size = sizes
-            .get(index)
-            .ok_or_else(|| SodaError::crypto("invalid sample table"))?;
-        total = total
-            .checked_add(size)
-            .ok_or_else(|| SodaError::crypto("sample size overflow"))?;
-    }
-    Ok(total)
 }
 
 /// 等价 `parseSenc`。
@@ -1604,23 +1601,23 @@ fn senc_header(data: &[u8], iv_size: usize) -> Option<(bool, usize, usize)> {
 }
 
 /// 读一条 `senc` 记录：IV + 可选的 subsample 表。数据不够时返回 `None`。
+///
+/// 边界推进交给 [`skip_senc_record`]，两处不再各写一遍。
 fn read_senc_record(
     data: &[u8],
     ptr: usize,
     iv_size: usize,
     has_subsamples: bool,
 ) -> Option<(SencSample, usize)> {
-    let end = ptr.checked_add(iv_size)?;
-    let iv = data.get(ptr..end)?.to_vec();
-    let mut next = end;
+    let next = skip_senc_record(data, ptr, iv_size, has_subsamples)?;
+    let iv_end = ptr.checked_add(iv_size)?;
+    let iv = data.get(ptr..iv_end)?.to_vec();
     let mut subsamples = Vec::new();
     if has_subsamples {
-        let count_end = next.checked_add(2)?;
-        let pair = data.get(next..count_end)?;
+        let count_end = iv_end.checked_add(2)?;
+        let pair = data.get(iv_end..count_end)?;
         let sub_count = u16::from_be_bytes([pair[0], pair[1]]) as usize;
-        next = count_end;
-        let table_end = next.checked_add(sub_count.checked_mul(6)?)?;
-        let table = data.get(next..table_end)?;
+        let table = data.get(count_end..next)?;
         subsamples.reserve(sub_count);
         for chunk in table.chunks_exact(6) {
             subsamples.push(SencSubsample {
@@ -1628,7 +1625,6 @@ fn read_senc_record(
                 encrypted: u32::from_be_bytes([chunk[2], chunk[3], chunk[4], chunk[5]]),
             });
         }
-        next = table_end;
     }
     Some((SencSample { iv, subsamples }, next))
 }

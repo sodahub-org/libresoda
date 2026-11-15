@@ -1,6 +1,7 @@
 //! 票 #49：计划阶段不按声明的样本数展开，峰值分配不随样本数放大。
 //!
-//! 单独放一个测试文件：计数分配器是全局的，同一个二进制里跑别的用例会互相干扰。
+//! 单独放一个测试文件：计数分配器是进程级的，同一个二进制里跑别的用例会互相干扰，
+//! 所以这里只留一个测试函数，两种情况串行测。
 
 use libresoda::soda::crypto::{decrypt_audio_with_key, decrypt_stream};
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -40,9 +41,19 @@ fn mp4_box(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
     out
 }
 
+/// `count` 条 `senc` 记录，每条 8 字节 IV。
+fn senc_payload(count: u32) -> Vec<u8> {
+    let mut senc = vec![0u8; 8 + (count as usize) * 8];
+    senc[4..8].copy_from_slice(&count.to_be_bytes());
+    for chunk in senc[8..].chunks_exact_mut(8) {
+        chunk.copy_from_slice(&[1u8; 8]);
+    }
+    senc
+}
+
 /// 一条轨的 `stbl`：定长 `stsz`（`count` 个 `sample_size` 字节）+ 单条 `stsc`/`stco`，
-/// 带 `senc` 时再加一条解密记录。
-fn track_stbl(sample_size: u32, count: u32, chunk_offset: u32, with_senc: bool) -> Vec<u8> {
+/// 给了 `senc` 载荷就再加一个 `senc` box。
+fn track_stbl(sample_size: u32, count: u32, chunk_offset: u32, senc: Option<&[u8]>) -> Vec<u8> {
     let mut stsz = vec![0u8; 12];
     stsz[4..8].copy_from_slice(&sample_size.to_be_bytes());
     stsz[8..12].copy_from_slice(&count.to_be_bytes());
@@ -60,13 +71,20 @@ fn track_stbl(sample_size: u32, count: u32, chunk_offset: u32, with_senc: bool) 
     payload.extend_from_slice(&mp4_box(b"stsz", &stsz));
     payload.extend_from_slice(&mp4_box(b"stsc", &stsc));
     payload.extend_from_slice(&mp4_box(b"stco", &stco));
-    if with_senc {
-        let mut senc = vec![0u8; 8 + 8];
-        senc[4..8].copy_from_slice(&1u32.to_be_bytes());
-        senc[8..16].copy_from_slice(&[1u8; 8]);
-        payload.extend_from_slice(&mp4_box(b"senc", &senc));
+    if let Some(senc) = senc {
+        payload.extend_from_slice(&mp4_box(b"senc", senc));
     }
     mp4_box(b"stbl", &payload)
+}
+
+fn track(sample_size: u32, count: u32, chunk_offset: u32, senc: Option<&[u8]>) -> Vec<u8> {
+    mp4_box(
+        b"trak",
+        &mp4_box(
+            b"mdia",
+            &mp4_box(b"minf", &track_stbl(sample_size, count, chunk_offset, senc)),
+        ),
+    )
 }
 
 /// 畸形构造：明文轨声明 `sample_count` 个 1 字节样本，实际 `mdat` 只有 16 字节；
@@ -74,32 +92,38 @@ fn track_stbl(sample_size: u32, count: u32, chunk_offset: u32, with_senc: bool) 
 ///
 /// 单个 chunk 装下全部样本，表本身只有几十字节——文件很小，声明很大。
 fn huge_fixture(sample_count: u32) -> Vec<u8> {
-    let mdat_payload_len = 16u32;
+    const PAYLOAD_LEN: usize = 16;
     let build = |payload_start: u32| {
-        let text = mp4_box(
-            b"trak",
-            &mp4_box(
-                b"mdia",
-                &mp4_box(b"minf", &track_stbl(1, sample_count, payload_start, false)),
-            ),
-        );
-        let audio = mp4_box(
-            b"trak",
-            &mp4_box(
-                b"mdia",
-                &mp4_box(b"minf", &track_stbl(16, 1, payload_start + 1000, true)),
-            ),
-        );
+        let text = track(1, sample_count, payload_start, None);
+        let audio = track(16, 1, payload_start + 1000, Some(&senc_payload(1)));
         let mut moov_payload = Vec::new();
         moov_payload.extend_from_slice(&text);
         moov_payload.extend_from_slice(&audio);
         let mut file = mp4_box(b"moov", &moov_payload);
-        file.extend_from_slice(&mp4_box(b"mdat", &[9u8; mdat_payload_len as usize]));
+        file.extend_from_slice(&mp4_box(b"mdat", &[9u8; PAYLOAD_LEN]));
         file
     };
     // 先量出 moov 长度，再把 chunk 偏移指到 mdat 载荷起点
     let probe = build(0);
-    let payload_start = (probe.len() - mdat_payload_len as usize) as u32;
+    let payload_start = (probe.len() - PAYLOAD_LEN) as u32;
+    build(payload_start)
+}
+
+/// 合法构造：`count` 个 1 字节样本，每个样本一条 `senc` 记录，`mdat` 正好 `count` 字节。
+///
+/// 用来量 `senc` 那条路径的峰值：表大但样本小，旧实现会把每条记录展开成 48 字节的结构体
+/// 外加一次 IV 堆分配。
+fn senc_heavy_fixture(count: u32) -> Vec<u8> {
+    let payload_len = count as usize;
+    let build = |payload_start: u32| {
+        let senc = senc_payload(count);
+        let trak = track(1, count, payload_start, Some(&senc));
+        let mut file = mp4_box(b"moov", &trak);
+        file.extend_from_slice(&mp4_box(b"mdat", &vec![7u8; payload_len]));
+        file
+    };
+    let probe = build(0);
+    let payload_start = (probe.len() - payload_len) as u32;
     build(payload_start)
 }
 
@@ -112,11 +136,10 @@ fn measure<T>(run: impl FnOnce() -> T) -> (T, usize) {
     (value, peak)
 }
 
-/// 票 #49：小文件声明 100 万样本时，两条路径都必须不展开位置表就拒绝，
-/// 峰值分配留在 KB 级，不再出现过去的几十上百 MB。
+/// 票 #49：计划阶段的内存不能跟着声明的样本数走。
 #[test]
-fn huge_declared_sample_count_keeps_plan_memory_small() {
-    // 卡在计划上限 1M（票 #44）以内，正好压测惰性游标。
+fn plan_memory_follows_input_not_declared_samples() {
+    // 一、小文件声明 100 万样本（计划上限 1M 以内）：两条路径都必须不展开位置表就拒绝。
     let file = huge_fixture(1_000_000);
     assert!(
         file.len() < 4096,
@@ -125,20 +148,55 @@ fn huge_declared_sample_count_keeps_plan_memory_small() {
     );
 
     let (stream, stream_peak) = measure(|| {
-        let mut input = std::io::Cursor::new(file.clone());
+        let mut input = std::io::Cursor::new(file.as_slice());
         let mut out = Vec::new();
         decrypt_stream(&mut input, &KEY, &mut out)
     });
-    assert!(stream.is_err(), "声明的样本装不进 mdat，应报错");
+    let err = stream.expect_err("声明的样本装不进 mdat，应报错");
+    assert_eq!(
+        err.to_string(),
+        "decrypted size mismatch",
+        "拒绝点应是覆盖核对"
+    );
     assert!(
-        stream_peak < 8 * 1024 * 1024,
-        "流式路径峰值 {stream_peak} 字节，超过 8MiB"
+        stream_peak < 1024 * 1024,
+        "流式路径峰值 {stream_peak} 字节，4KB 输入不该超过 1MiB"
     );
 
     let (batch, batch_peak) = measure(|| decrypt_audio_with_key(&file, &KEY));
-    assert!(batch.is_err(), "声明的样本装不进 mdat，应报错");
+    let err = batch.expect_err("声明的样本装不进 mdat，应报错");
+    assert_eq!(
+        err.to_string(),
+        "decrypted size mismatch",
+        "拒绝点应是字节预算"
+    );
     assert!(
-        batch_peak < 8 * 1024 * 1024,
-        "整块路径峰值 {batch_peak} 字节，超过 8MiB"
+        batch_peak < 1024 * 1024,
+        "整块路径峰值 {batch_peak} 字节，4KB 输入不该超过 1MiB"
+    );
+
+    // 二、合法的长 senc 表：峰值应和输入同量级，而不是按记录数展开。
+    let file = senc_heavy_fixture(200_000);
+    let limit = file.len() * 4;
+
+    let (stream, stream_peak) = measure(|| {
+        let mut input = std::io::Cursor::new(file.as_slice());
+        let mut out = Vec::with_capacity(file.len());
+        decrypt_stream(&mut input, &KEY, &mut out)
+    });
+    stream.expect("合法文件应能流式解密");
+    assert!(
+        stream_peak < limit,
+        "流式路径峰值 {stream_peak} 字节，超过输入 {} 字节的 4 倍",
+        file.len()
+    );
+
+    let (batch, batch_peak) = measure(|| decrypt_audio_with_key(&file, &KEY));
+    let plain = batch.expect("合法文件应能整块解密");
+    assert_eq!(plain.len(), file.len(), "解密输出长度应与输入一致");
+    assert!(
+        batch_peak < limit,
+        "整块路径峰值 {batch_peak} 字节，超过输入 {} 字节的 4 倍",
+        file.len()
     );
 }
