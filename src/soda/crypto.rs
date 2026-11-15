@@ -27,7 +27,7 @@ const MAX_SAMPLE_ENTRIES: usize = 4 * 1024 * 1024;
 ///
 /// 计划要把每个样本的尺寸、位置、`senc` 记录都落内存，64 位下约 100 字节/样本：
 /// 沿用 `MAX_SAMPLE_ENTRIES`（4M）时最坏峰值约 400–500MB。正常曲目只有几千到几万条，
-/// 1M 足够约 6 小时音频（48kHz AAC），把最坏元数据压到 ~100MB 量级。
+/// 1M 足够约 6 小时音频（48kHz AAC），最坏元数据约 120MB（含 `senc` 与 IV 分配）。
 /// 只约束计划阶段；`parse_stsz`/`parse_senc` 等独立解析仍用更宽的 `MAX_SAMPLE_ENTRIES`。
 const MAX_PLAN_SAMPLES: usize = 1024 * 1024;
 
@@ -534,18 +534,19 @@ fn child_box<'a>(data: &'a [u8], kind: &[u8; 4], parent: &Mp4Box<'a>) -> Option<
 
 /// 表类 box 的公共头：版本/标志后跟条目数。
 ///
-/// 声明条目数超过实际可读条目数或硬上限时返回 `None`；调用方按损坏文件报错，
-/// 不能把截短后的表当成完整表。硬上限取 `MAX_PLAN_SAMPLES`：chunk 数不会超过样本数
-/// （每个 chunk 至少装一个样本），计划上限同样兜得住（票 #44）。
+/// 声明条目数超过实际可读条目数或 `max_entries` 时返回 `None`；调用方按损坏文件报错，
+/// 不能把截短后的表当成完整表。计划阶段传 `MAX_PLAN_SAMPLES`：chunk 数不会超过样本数
+/// （每个 chunk 至少装一个样本），计划上限同样兜得住（票 #44）。表本身还受实际数据
+/// 长度约束，这一条与上限是两道独立的闸。
 ///
 /// 上游没有这个辅助；票 #42 新增。
-fn table_entry_count(data: &[u8], entry_size: usize) -> Option<usize> {
+fn table_entry_count(data: &[u8], entry_size: usize, max_entries: usize) -> Option<usize> {
     if data.len() < 8 {
         return Some(0);
     }
     let declared = u32::from_be_bytes([data[4], data[5], data[6], data[7]]) as usize;
     let available = data.len().saturating_sub(8) / entry_size;
-    if declared > available || declared > MAX_PLAN_SAMPLES {
+    if declared > available || declared > max_entries {
         return None;
     }
     Some(declared)
@@ -555,7 +556,7 @@ fn table_entry_count(data: &[u8], entry_size: usize) -> Option<usize> {
 ///
 /// 上游没有对应的独立函数；票 #42 多轨修复新增。
 fn parse_stsc(data: &[u8]) -> Option<Vec<StscEntry>> {
-    let count = table_entry_count(data, 12)?;
+    let count = table_entry_count(data, 12, MAX_PLAN_SAMPLES)?;
     if count == 0 {
         return Some(Vec::new());
     }
@@ -575,7 +576,7 @@ fn parse_stsc(data: &[u8]) -> Option<Vec<StscEntry>> {
 ///
 /// 上游没有对应的独立函数；票 #42 新增。
 fn parse_stco(data: &[u8]) -> Option<Vec<u64>> {
-    let count = table_entry_count(data, 4)?;
+    let count = table_entry_count(data, 4, MAX_PLAN_SAMPLES)?;
     if count == 0 {
         return Some(Vec::new());
     }
@@ -592,7 +593,7 @@ fn parse_stco(data: &[u8]) -> Option<Vec<u64>> {
 ///
 /// 上游没有对应的独立函数；票 #42 新增。
 fn parse_co64(data: &[u8]) -> Option<Vec<u64>> {
-    let count = table_entry_count(data, 8)?;
+    let count = table_entry_count(data, 8, MAX_PLAN_SAMPLES)?;
     if count == 0 {
         return Some(Vec::new());
     }
@@ -1173,8 +1174,11 @@ mod tests {
     fn table_entry_count_rejects_over_plan_cap() {
         let mut data = vec![0u8; 8 + (MAX_PLAN_SAMPLES + 1) * 4];
         data[4..8].copy_from_slice(&(MAX_PLAN_SAMPLES as u32 + 1).to_be_bytes());
-        assert_eq!(table_entry_count(&data, 4), None);
+        assert_eq!(table_entry_count(&data, 4, MAX_PLAN_SAMPLES), None);
         data[4..8].copy_from_slice(&(MAX_PLAN_SAMPLES as u32).to_be_bytes());
-        assert_eq!(table_entry_count(&data, 4), Some(MAX_PLAN_SAMPLES));
+        assert_eq!(
+            table_entry_count(&data, 4, MAX_PLAN_SAMPLES),
+            Some(MAX_PLAN_SAMPLES)
+        );
     }
 }

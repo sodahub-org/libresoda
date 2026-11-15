@@ -141,19 +141,26 @@ fn decrypt_rejects_impossible_fixed_sample_count_quickly() {
     );
 }
 
-/// 票 #44：定长 `stsz` 声明 4M 样本（旧上限恰好放行），即使 mdat 字节数够，
-/// 也必须在计划阶段的更低硬上限处拒绝，而不是先展开几百 MB 元数据。
-#[test]
-fn decrypt_rejects_4m_samples_at_plan_cap() {
+/// 票 #44 用例共用：拼一条只带定长 `stsz` 的 `trak`。
+///
+/// 调用方传的 `sample_count` 锚的是 `crypto.rs` 里两条上限：旧上限
+/// `MAX_SAMPLE_ENTRIES`（4M）与计划上限 `MAX_PLAN_SAMPLES`（1M）。
+fn trak_with_fixed_stsz(sample_size: u32, sample_count: u32) -> Vec<u8> {
     let mut stsz_payload = vec![0u8; 12];
-    stsz_payload[4..8].copy_from_slice(&1u32.to_be_bytes()); // 定长 1 字节
-    stsz_payload[8..12].copy_from_slice(&(4 * 1024 * 1024u32).to_be_bytes());
+    stsz_payload[4..8].copy_from_slice(&sample_size.to_be_bytes());
+    stsz_payload[8..12].copy_from_slice(&sample_count.to_be_bytes());
     let stsz = mp4_box(b"stsz", &stsz_payload);
     let stbl = mp4_box(b"stbl", &stsz);
     let minf = mp4_box(b"minf", &stbl);
     let mdia = mp4_box(b"mdia", &minf);
-    let trak = mp4_box(b"trak", &mdia);
-    let moov = mp4_box(b"moov", &trak);
+    mp4_box(b"trak", &mdia)
+}
+
+/// 票 #44：定长 `stsz` 声明 4M 样本（等于旧上限，旧口径会放行），即使 mdat
+/// 字节数够，也必须在计划阶段的更低硬上限处拒绝，而不是先展开几百 MB 元数据。
+#[test]
+fn decrypt_rejects_4m_samples_at_plan_cap() {
+    let moov = mp4_box(b"moov", &trak_with_fixed_stsz(1, 4 * 1024 * 1024));
     let mut file = moov;
     // mdat 给够 4MB：没有新上限时字节数校验会放行，接着展开位置表/计划表。
     let mdat_payload = vec![0u8; 4 * 1024 * 1024];
@@ -161,6 +168,7 @@ fn decrypt_rejects_4m_samples_at_plan_cap() {
 
     let started = std::time::Instant::now();
     let err = decrypt_audio_with_key(&file, &KEY).unwrap_err();
+    // 这句话只有 `parse_stsz_limited` 在分配尺寸表之前会报，锁死拒绝点。
     assert_eq!(err.to_string(), "sample table is unreasonably large");
     assert!(
         started.elapsed().as_secs() < 5,
@@ -168,22 +176,12 @@ fn decrypt_rejects_4m_samples_at_plan_cap() {
     );
 }
 
-/// 票 #44：两条轨各自声明 60 万样本（单轨都不超上限），合计超过计划上限时，
+/// 票 #44：两条轨各声明 60 万样本（单轨都不超 1M），合计 120 万超过计划上限时，
 /// 第二条轨必须在剩余预算处拒绝。
 #[test]
 fn decrypt_rejects_cumulative_samples_over_plan_cap() {
-    let track = || {
-        let mut stsz_payload = vec![0u8; 12];
-        stsz_payload[4..8].copy_from_slice(&1u32.to_be_bytes());
-        stsz_payload[8..12].copy_from_slice(&600_000u32.to_be_bytes());
-        let stsz = mp4_box(b"stsz", &stsz_payload);
-        let stbl = mp4_box(b"stbl", &stsz);
-        let minf = mp4_box(b"minf", &stbl);
-        let mdia = mp4_box(b"mdia", &minf);
-        mp4_box(b"trak", &mdia)
-    };
-    let mut moov_payload = track();
-    moov_payload.extend_from_slice(&track());
+    let mut moov_payload = trak_with_fixed_stsz(1, 600_000);
+    moov_payload.extend_from_slice(&trak_with_fixed_stsz(1, 600_000));
     let moov = mp4_box(b"moov", &moov_payload);
     let mut file = moov;
     let mdat_payload = vec![0u8; 1_200_000];
