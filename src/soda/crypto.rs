@@ -12,6 +12,8 @@ use crate::util::bitcount;
 use aes::cipher::{KeyIvInit, StreamCipher};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::io::{Read, Write};
 
 type Aes128Ctr = ctr::Ctr128BE<aes::Aes128>;
@@ -855,7 +857,8 @@ impl<'plan> TrackSamples<'plan> {
             .ok_or_else(|| SodaError::crypto("invalid sample table"))?;
         let layout = self.layout;
         let offset = match layout {
-            TrackLayout::Empty => return Ok(None),
+            // 有样本却没有布局：构造阶段就不该出现，宁可报错也不静默吞掉样本。
+            TrackLayout::Empty => return Err(SodaError::crypto("invalid sample table")),
             TrackLayout::Legacy { .. } => {
                 let offset = self.offset;
                 self.offset = offset
@@ -918,39 +921,51 @@ impl<'plan> TrackSamples<'plan> {
 /// 多条轨的样本按文件偏移归并：每次只算「各轨当前的下一个样本」，不落全量列表。
 ///
 /// 归并按（偏移, 轨序号）排序，与旧实现「全量收集后按偏移排序」对同位样本的先后不敏感
-/// ——同位只可能是 0 字节样本，先写谁都不产出字节。
+/// ——同位只可能是 0 字节样本，先写谁都不产出字节。堆里每条轨只放一个当前样本，
+/// 取下一个是 O(log 轨数)，不会每个样本扫一遍所有轨。
 #[derive(Clone)]
 struct SampleWalk<'plan> {
     cursors: Vec<TrackSamples<'plan>>,
-    peeked: Vec<Option<PlannedSample>>,
+    /// 各轨当前样本的最小堆，键是（偏移, 轨序号, 尺寸）。
+    heap: BinaryHeap<Reverse<(usize, usize, usize)>>,
 }
 
 impl<'plan> SampleWalk<'plan> {
     fn new(mut cursors: Vec<TrackSamples<'plan>>) -> Result<Self> {
-        let mut peeked = Vec::with_capacity(cursors.len());
+        let mut heap = BinaryHeap::with_capacity(cursors.len());
         for cursor in cursors.iter_mut() {
-            peeked.push(cursor.next()?);
+            if let Some(sample) = cursor.next()? {
+                heap.push(Reverse((sample.offset, sample.track, sample.size)));
+            }
         }
-        Ok(SampleWalk { cursors, peeked })
+        Ok(SampleWalk { cursors, heap })
     }
 
     /// 当前最靠前的样本，不消费。
     fn peek(&self) -> Option<PlannedSample> {
-        self.peeked
-            .iter()
-            .flatten()
-            .min_by_key(|sample| (sample.offset, sample.track))
-            .copied()
+        self.heap
+            .peek()
+            .map(|Reverse((offset, track, size))| PlannedSample {
+                offset: *offset,
+                size: *size,
+                track: *track,
+            })
     }
 
     /// 消费当前最靠前的样本，并把那条轨推进一个。
     fn advance(&mut self) -> Result<Option<PlannedSample>> {
-        let Some(best) = self.peek() else {
+        let Some(Reverse((offset, track, size))) = self.heap.pop() else {
             return Ok(None);
         };
-        let track = best.track;
-        self.peeked[track] = self.cursors[track].next()?;
-        Ok(Some(best))
+        if let Some(next) = self.cursors[track].next()? {
+            self.heap
+                .push(Reverse((next.offset, next.track, next.size)));
+        }
+        Ok(Some(PlannedSample {
+            offset,
+            size,
+            track,
+        }))
     }
 }
 

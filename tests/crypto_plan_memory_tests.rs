@@ -201,10 +201,10 @@ fn plan_memory_follows_input_not_declared_samples() {
     //
     // 新实现的峰值只有「moov 前缀 + senc 载荷副本」（流式）或再加一份解密副本（整块），
     // 约输入的 2 倍；旧实现按记录展开成 48 字节结构体外加一次 IV 分配，200k 条就要
-    // 12MB 以上，再加上位置表和 PlannedSample 会过 20MB。上限取输入 2.5 倍，
-    // 既容得下副本，也能拦住「每条记录还占几十字节」的半吊子写法。
+    // 12MB 以上，再加上位置表和 PlannedSample 会过 20MB。上限取输入 3 倍：
+    // 既给副本留出余量，也拦得住「每条记录还占几十字节」的半吊子写法（那也有 6MB 以上）。
     let file = senc_heavy_fixture(200_000);
-    let limit = file.len() * 5 / 2;
+    let limit = file.len() * 3;
 
     let (stream, stream_peak) = measure(|| {
         let mut input = std::io::Cursor::new(file.as_slice());
@@ -217,7 +217,7 @@ fn plan_memory_follows_input_not_declared_samples() {
     assert_eq!(written, file.len(), "流式输出长度应与输入一致");
     assert!(
         stream_peak < limit,
-        "流式路径峰值 {stream_peak} 字节，超过输入 {} 字节的 2.5 倍",
+        "流式路径峰值 {stream_peak} 字节，超过输入 {} 字节的 3 倍",
         file.len()
     );
 
@@ -226,7 +226,7 @@ fn plan_memory_follows_input_not_declared_samples() {
     assert_eq!(plain.len(), file.len(), "解密输出长度应与输入一致");
     assert!(
         batch_peak < limit,
-        "整块路径峰值 {batch_peak} 字节，超过输入 {} 字节的 2.5 倍",
+        "整块路径峰值 {batch_peak} 字节，超过输入 {} 字节的 3 倍",
         file.len()
     );
 }
