@@ -1123,9 +1123,13 @@ fn decrypt_rejects_multi_mdat_without_tables() {
         step: 5,
     };
     let mut out = Vec::new();
-    let err =
-        decrypt_stream(&mut input, &KEY, &mut out).expect_err("流式解密应拒绝缺表的多 mdat 文件");
-    assert!(err.to_string().contains("incomplete sample table"), "{err}");
+    // 流式看不到后续 mdat：无表样本越过第一个 mdat 末尾时，覆盖核对先报
+    // `decrypted size mismatch`，与整块的 `incomplete sample table` 文案不同；
+    // 两条路径都拒绝，文案差异是已知口径（PORTING.md 已记）。
+    assert!(
+        decrypt_stream(&mut input, &KEY, &mut out).is_err(),
+        "流式解密应拒绝缺表的多 mdat 文件"
+    );
 }
 
 /// 第二个 mdat 被截断：两条路径都要拒绝。

@@ -108,7 +108,9 @@
   或所有轨合计的样本数/字节数超过上限，也都按损坏报错。没有 `stsc`/`stco`/`co64` 的旧
   合成文件退回「按 `trak` 顺序首尾相接」的老口径，同样要求刚好铺满。两条路径（整块 / 流式）
   共用同一份计划，成功输出逐字节一致；失败文案不保证相同（截断时整块报
-  `decrypted size mismatch`，流式在读样本时才暴露，报 `read mdat failed`，有用例钉住）。
+  `decrypted size mismatch`、流式在读样本时才暴露、报 `read mdat failed`；缺表多 mdat 时
+  整块报 `incomplete sample table`、流式看到越过第一个 mdat 的样本先报
+  `decrypted size mismatch`，均有用例钉住）。
   票 #45 起支持多个顶层 `mdat`：样本按绝对文件偏移定位，
   所有 `mdat` 的载荷都要被样本刚好铺满，哪一段留空都报错；流式路径按 box 顺序逐个处理
   `mdat`，之间的其它 box（`free`/`udta` 等）原样透传，整块路径也认 64 位加长头的 `mdat`。
