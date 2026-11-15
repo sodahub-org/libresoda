@@ -329,7 +329,7 @@ pub fn decrypt_stream<R: Read, W: Write>(
                 }
             }
             write_box_header(out, &head, ext)?;
-            std::io::copy(&mut input.take(size - header_len), out)
+            std::io::copy(&mut input.take((size - header_len) as u64), out)
                 .map_err(|err| SodaError::crypto(format!("write failed: {err}")))?;
         }
         offset = box_end;
