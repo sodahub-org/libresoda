@@ -33,6 +33,22 @@ static GLOBAL: Counting = Counting;
 
 const KEY: [u8; 16] = [0u8; 16];
 
+/// 只数字节、不存内容的写出目标：量流式路径本身的内存，不让输出 buffer 混进峰值。
+struct Sink {
+    written: usize,
+}
+
+impl std::io::Write for Sink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.written += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn mp4_box(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(8 + payload.len());
     out.extend_from_slice(&((8 + payload.len()) as u32).to_be_bytes());
@@ -140,6 +156,9 @@ fn measure<T>(run: impl FnOnce() -> T) -> (T, usize) {
 #[test]
 fn plan_memory_follows_input_not_declared_samples() {
     // 一、小文件声明 100 万样本（计划上限 1M 以内）：两条路径都必须不展开位置表就拒绝。
+    //
+    // 4KB 输入 + 几十字节的表，计划阶段只该占几十 KB；1MiB 的上限留足了余量，
+    // 又远低于旧实现按样本数展开的 16MiB 起步。
     let file = huge_fixture(1_000_000);
     assert!(
         file.len() < 4096,
@@ -149,15 +168,18 @@ fn plan_memory_follows_input_not_declared_samples() {
 
     let (stream, stream_peak) = measure(|| {
         let mut input = std::io::Cursor::new(file.as_slice());
-        let mut out = Vec::new();
-        decrypt_stream(&mut input, &KEY, &mut out)
+        let mut out = Sink { written: 0 };
+        let result = decrypt_stream(&mut input, &KEY, &mut out);
+        (result, out.written)
     });
-    let err = stream.expect_err("声明的样本装不进 mdat，应报错");
+    let (result, written) = stream;
+    let err = result.expect_err("声明的样本装不进 mdat，应报错");
     assert_eq!(
         err.to_string(),
         "decrypted size mismatch",
         "拒绝点应是覆盖核对"
     );
+    assert_eq!(written, 0, "覆盖核对失败时不该写出任何字节");
     assert!(
         stream_peak < 1024 * 1024,
         "流式路径峰值 {stream_peak} 字节，4KB 输入不该超过 1MiB"
@@ -175,19 +197,27 @@ fn plan_memory_follows_input_not_declared_samples() {
         "整块路径峰值 {batch_peak} 字节，4KB 输入不该超过 1MiB"
     );
 
-    // 二、合法的长 senc 表：峰值应和输入同量级，而不是按记录数展开。
+    // 二、合法的长 senc 表：200k 条记录、每条 8 字节，表约 1.6MB。
+    //
+    // 新实现的峰值只有「moov 前缀 + senc 载荷副本」（流式）或再加一份解密副本（整块），
+    // 约输入的 2 倍；旧实现按记录展开成 48 字节结构体外加一次 IV 分配，200k 条就要
+    // 12MB 以上，再加上位置表和 PlannedSample 会过 20MB。上限取输入 2.5 倍，
+    // 既容得下副本，也能拦住「每条记录还占几十字节」的半吊子写法。
     let file = senc_heavy_fixture(200_000);
-    let limit = file.len() * 4;
+    let limit = file.len() * 5 / 2;
 
     let (stream, stream_peak) = measure(|| {
         let mut input = std::io::Cursor::new(file.as_slice());
-        let mut out = Vec::with_capacity(file.len());
-        decrypt_stream(&mut input, &KEY, &mut out)
+        let mut out = Sink { written: 0 };
+        let result = decrypt_stream(&mut input, &KEY, &mut out);
+        (result, out.written)
     });
-    stream.expect("合法文件应能流式解密");
+    let (result, written) = stream;
+    result.expect("合法文件应能流式解密");
+    assert_eq!(written, file.len(), "流式输出长度应与输入一致");
     assert!(
         stream_peak < limit,
-        "流式路径峰值 {stream_peak} 字节，超过输入 {} 字节的 4 倍",
+        "流式路径峰值 {stream_peak} 字节，超过输入 {} 字节的 2.5 倍",
         file.len()
     );
 
@@ -196,7 +226,7 @@ fn plan_memory_follows_input_not_declared_samples() {
     assert_eq!(plain.len(), file.len(), "解密输出长度应与输入一致");
     assert!(
         batch_peak < limit,
-        "整块路径峰值 {batch_peak} 字节，超过输入 {} 字节的 4 倍",
+        "整块路径峰值 {batch_peak} 字节，超过输入 {} 字节的 2.5 倍",
         file.len()
     );
 }

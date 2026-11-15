@@ -21,6 +21,12 @@ const AES_BLOCK_SIZE: usize = 16;
 /// `senc` 载荷的公共头长度：版本/标志 + 条目数。
 const SENC_HEADER_LEN: usize = 8;
 
+/// `stsz` 载荷的公共头长度：版本/标志 + 定长尺寸 + 条目数。
+const STSZ_HEADER_LEN: usize = 12;
+
+/// 变长 `stsz` 每条样本尺寸占的字节数。
+const STSZ_ENTRY_LEN: usize = 4;
+
 /// 防御性上限：单个 box 允许的最大样本条目数。
 ///
 /// MP4 头里的 `sample_count` 是 32 位字段，损坏或被截断的文件可以声明约 43 亿条，
@@ -28,12 +34,13 @@ const SENC_HEADER_LEN: usize = 8;
 /// 正常音频（48kHz、每帧约 1024 采样）即使数小时也只有几万条，4M 足够宽裕。
 const MAX_SAMPLE_ENTRIES: usize = 4 * 1024 * 1024;
 
-/// 防御性上限：解密计划阶段允许展开的样本总数（所有轨合计，票 #44）。
+/// 防御性上限：解密计划阶段允许处理的样本总数（所有轨合计，票 #44）。
 ///
-/// 计划要把每个样本的尺寸、位置、`senc` 记录都落内存，64 位下约 100 字节/样本：
-/// 沿用 `MAX_SAMPLE_ENTRIES`（4M）时最坏峰值约 400–500MB。正常曲目只有几千到几万条，
-/// 1M 足够约 6 小时音频（48kHz AAC），最坏元数据约 120MB（含 `senc` 与 IV 分配）。
-/// 只约束计划阶段；`parse_stsz`/`parse_senc` 等独立解析仍用更宽的 `MAX_SAMPLE_ENTRIES`。
+/// 计划本身不再按样本数分配（票 #49），这个上限限的是「游标要走过多少条」：声明的
+/// 条目数直接决定计划阶段空跑一遍的工作量。1M 足够约 6 小时音频（48kHz AAC），正常
+/// 曲目只有几千到几万条，不受影响；超限的畸形文件在解析尺寸表时就报
+/// `sample table is unreasonably large`。只约束计划阶段；`parse_stsz`/`parse_senc`
+/// 等独立解析仍用更宽的 `MAX_SAMPLE_ENTRIES`。
 const MAX_PLAN_SAMPLES: usize = 1024 * 1024;
 
 /// 流式解密允许缓存在内存里的「mdat 之前」字节上限。
@@ -94,8 +101,8 @@ impl SampleSizes {
                 if index >= *count {
                     return None;
                 }
-                let start = 12 + index * 4;
-                let bytes = data.get(start..start + 4)?;
+                let start = STSZ_HEADER_LEN + index * STSZ_ENTRY_LEN;
+                let bytes = data.get(start..start + STSZ_ENTRY_LEN)?;
                 Some(u32::from_be_bytes(bytes.try_into().ok()?) as usize)
             }
         }
@@ -385,7 +392,7 @@ pub fn decrypt_stream<R: Read, W: Write>(
     // 第一个 mdat 的覆盖核对放在写任何输出之前，与整块路径一样先验后写。
     // 核对只推进一份副本，真正的游标留给后面的解密。
     let mut probe = walk.clone();
-    cover_mdat_payload(&mut probe, mdat_payload_start, mdat_payload_len)?;
+    let first_count = cover_mdat_payload(&mut probe, mdat_payload_start, mdat_payload_len)?;
 
     // stsd 里的 `enca` 还原成 `frma` 指向的原始编码格式（与整块解密一致）
     for track in &plan.tracks {
@@ -402,16 +409,13 @@ pub fn decrypt_stream<R: Read, W: Write>(
     // 4) 逐样本解密第一个 mdat。覆盖核对已经确认样本按文件偏移刚好铺满载荷，
     //    没有需要原样透传的间隙。
     let mut senc_readers = SencReaders::new(&plan);
-    let first_payload_end = mdat_payload_start
-        .checked_add(mdat_payload_len)
-        .ok_or_else(|| SodaError::crypto("mdat size overflow"))?;
     write_samples(
         input,
         out,
         key_bytes,
         &mut senc_readers,
         &mut walk,
-        first_payload_end,
+        first_count,
     )?;
 
     // 5) 后面的顶层 box 逐个走：mdat 继续按样本解密，其它 box（udta / free …）
@@ -468,19 +472,9 @@ pub fn decrypt_stream<R: Read, W: Write>(
             let payload_len = size - header_len;
             // 同样先拿副本核对，通过了再动真正的游标和输出。
             let mut probe = walk.clone();
-            cover_mdat_payload(&mut probe, payload_start, payload_len)?;
+            let count = cover_mdat_payload(&mut probe, payload_start, payload_len)?;
             write_box_header(out, &head, ext)?;
-            let payload_end = payload_start
-                .checked_add(payload_len)
-                .ok_or_else(|| SodaError::crypto("mdat size overflow"))?;
-            write_samples(
-                input,
-                out,
-                key_bytes,
-                &mut senc_readers,
-                &mut walk,
-                payload_end,
-            )?;
+            write_samples(input, out, key_bytes, &mut senc_readers, &mut walk, count)?;
         } else {
             // 非 mdat 的 box 里不能藏着样本：有样本指进来就说明表对不上
             if let Some(sample) = walk.peek() {
@@ -502,23 +496,22 @@ pub fn decrypt_stream<R: Read, W: Write>(
     Ok(())
 }
 
-/// 按文件顺序把一段样本从输入读出、解密（没有 `senc` 的原样透传）、写出。
+/// 按文件顺序把覆盖核对回报的一段样本从输入读出、解密（没有 `senc` 的原样透传）、写出。
 ///
-/// 只消费落在 `payload_end` 以内的样本；覆盖核对已经确认这些样本刚好铺满载荷。
-/// 上游没有这个辅助；票 #45 新增，票 #49 改成从惰性游标取样本。
+/// `count` 是 `cover_mdat_payload` 刚在这段载荷里数出来的样本数，这里只按数取，
+/// 不再各自判断一遍边界。上游没有这个辅助；票 #45 新增，票 #49 改成消费惰性游标。
 fn write_samples<R: Read, W: Write>(
     input: &mut R,
     out: &mut W,
     key_bytes: &[u8],
     senc_readers: &mut SencReaders<'_>,
     walk: &mut SampleWalk<'_>,
-    payload_end: usize,
+    count: usize,
 ) -> Result<()> {
-    while let Some(sample) = walk.peek() {
-        if sample.offset > payload_end {
-            break;
-        }
-        walk.advance()?;
+    for _ in 0..count {
+        let Some(sample) = walk.advance()? else {
+            return Err(SodaError::crypto("decrypted size mismatch"));
+        };
         let mut chunk = vec![0u8; sample.size];
         input
             .read_exact(&mut chunk)
@@ -784,10 +777,12 @@ fn plan_track_samples(
                 .ok_or_else(|| SodaError::crypto("sample size overflow"))?;
             TrackLayout::Legacy { start }
         } else {
-            TrackLayout::Tables {
-                stsc: track.stsc.unwrap_or_default(),
-                chunks: track.chunks.unwrap_or_default(),
-            }
+            // 走到这里说明「有样本就必须有完整表」的不变量成立；缺表会先被
+            // any_without_tables 那条拒掉，这里再兜一次，不做静默降级。
+            let (Some(stsc), Some(chunks)) = (track.stsc, track.chunks) else {
+                return Err(SodaError::crypto("incomplete sample table"));
+            };
+            TrackLayout::Tables { stsc, chunks }
         };
         plans.push(TrackPlan {
             sizes: track.sizes,
@@ -853,7 +848,7 @@ impl<'plan> TrackSamples<'plan> {
     fn next(&mut self) -> Result<Option<PlannedSample>> {
         let sizes = self.sizes;
         if self.next_index >= sizes.len() {
-            return self.finish();
+            return self.finish_track();
         }
         let size = sizes
             .get(self.next_index)
@@ -910,7 +905,7 @@ impl<'plan> TrackSamples<'plan> {
     }
 
     /// 样本用完时收尾：表里还有没碰过的 chunk，说明样本数和 chunk 表对不上。
-    fn finish(&mut self) -> Result<Option<PlannedSample>> {
+    fn finish_track(&mut self) -> Result<Option<PlannedSample>> {
         if let TrackLayout::Tables { chunks, .. } = self.layout {
             if self.chunk_pos != chunks.len() {
                 return Err(SodaError::crypto("invalid sample table"));
@@ -1006,26 +1001,31 @@ impl<'plan> SencReaders<'plan> {
     }
 
     /// 取该轨下一个样本的解密记录；这条轨没有 `senc` 时返回 `None`（原样透传）。
+    ///
+    /// 轨号来自样本游标，一定落在 `readers` 里；直接索引，避免越界被 `?` 吞成
+    /// 「没有 senc」而把密文当明文写出去。
     fn next(&mut self, track: usize) -> Option<SencSample> {
-        self.readers.get_mut(track)?.as_mut()?.next()
+        self.readers[track].as_mut()?.next()
     }
 }
 
 /// 核对样本游标是否刚好铺满一段 `mdat` 载荷，并把它推到第一个不属于这段的样本。
 ///
-/// 铺不满、越过边界、指向这段之前，都按损坏报错：没认出来的字节可能是密文，
-/// 不能原样透传（票 #42 的口径，票 #45 推广到每一段 mdat）。
+/// 返回这段载荷里消费掉的样本数。铺不满、越过边界、指向这段之前，都按损坏报错：
+/// 没认出来的字节可能是密文，不能原样透传（票 #42 的口径，票 #45 推广到每一段 mdat）。
 ///
-/// 上游没有这个辅助；票 #45 新增，票 #49 改成消费惰性游标。
+/// 上游没有这个辅助；票 #45 新增，票 #49 改成消费惰性游标并回报样本数，
+/// 解密时按这个数取样本，不再各自判断一遍边界。
 fn cover_mdat_payload(
     walk: &mut SampleWalk<'_>,
     payload_start: usize,
     payload_len: usize,
-) -> Result<()> {
+) -> Result<usize> {
     let payload_end = payload_start
         .checked_add(payload_len)
         .ok_or_else(|| SodaError::crypto("mdat size overflow"))?;
     let mut cursor = payload_start;
+    let mut consumed = 0usize;
     while let Some(sample) = walk.peek() {
         // 正好落在载荷末尾的 0 字节样本归当前段所有（stsz 允许 0 尺寸）；
         // 真正越过末尾才交给下一段。
@@ -1046,11 +1046,12 @@ fn cover_mdat_payload(
             return Err(SodaError::crypto("decrypted size mismatch"));
         }
         walk.advance()?;
+        consumed += 1;
     }
     if cursor != payload_end {
         return Err(SodaError::crypto("decrypted size mismatch"));
     }
-    Ok(())
+    Ok(consumed)
 }
 
 /// 按文件顺序收集所有顶层 `mdat` 的载荷区间（起点, 长度）。
@@ -1456,7 +1457,7 @@ pub fn box_child_start(box_type: &[u8], offset: usize, header_size: usize) -> Op
 ///
 /// `parse_stsz` 的内部拆分；上游没有独立函数。
 fn stsz_header(data: &[u8]) -> Option<(usize, usize)> {
-    if data.len() < 12 {
+    if data.len() < STSZ_HEADER_LEN {
         return None;
     }
     Some((
@@ -1473,7 +1474,7 @@ fn stsz_effective_count(data: &[u8], sample_size_fixed: usize, declared_count: u
     if sample_size_fixed != 0 {
         declared_count
     } else {
-        let available = data.len().saturating_sub(12) / 4;
+        let available = data.len().saturating_sub(STSZ_HEADER_LEN) / STSZ_ENTRY_LEN;
         declared_count.min(available)
     }
 }
@@ -1489,8 +1490,8 @@ fn parse_stsz_entries(data: &[u8], sample_size_fixed: usize, sample_count: usize
         }
     } else {
         for (index, slot) in sizes.iter_mut().enumerate() {
-            let start = 12 + index * 4;
-            if start + 4 <= data.len() {
+            let start = STSZ_HEADER_LEN + index * STSZ_ENTRY_LEN;
+            if start + STSZ_ENTRY_LEN <= data.len() {
                 *slot = u32::from_be_bytes([
                     data[start],
                     data[start + 1],
@@ -1537,8 +1538,8 @@ fn parse_stsz_layout(data: &[u8], max_samples: usize) -> Option<SampleSizes> {
             count: effective,
         }
     } else {
-        // 只复制尺寸表本身（12 字节头 + 4 字节/条），box 后面的填充不跟着进内存。
-        let table_end = 12 + effective * 4;
+        // 只复制尺寸表本身（头 + 4 字节/条），box 后面的填充不跟着进内存。
+        let table_end = STSZ_HEADER_LEN + effective * STSZ_ENTRY_LEN;
         SampleSizes::Variable {
             data: data.get(..table_end)?.to_vec(),
             count: effective,
@@ -1615,10 +1616,10 @@ fn read_senc_record(
     let mut subsamples = Vec::new();
     if has_subsamples {
         let count_end = iv_end.checked_add(2)?;
-        let pair = data.get(iv_end..count_end)?;
-        let sub_count = u16::from_be_bytes([pair[0], pair[1]]) as usize;
+        // 记录边界已由 `skip_senc_record` 按真实数据校验过；容量按实际切出的表长度算，
+        // 不拿文件里的 u16 计数直接预分配。
         let table = data.get(count_end..next)?;
-        subsamples.reserve(sub_count);
+        subsamples.reserve(table.len() / 6);
         for chunk in table.chunks_exact(6) {
             subsamples.push(SencSubsample {
                 clear: u16::from_be_bytes([chunk[0], chunk[1]]),
