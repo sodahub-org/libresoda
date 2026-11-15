@@ -892,8 +892,8 @@ impl<'plan> TrackSamples<'plan> {
 #[derive(Clone)]
 struct SampleWalk<'plan> {
     cursors: Vec<TrackSamples<'plan>>,
-    /// 各轨当前样本的最小堆，键是（偏移, 尺寸, 轨序号）。
-    heap: BinaryHeap<Reverse<(usize, usize, usize)>>,
+    /// 各轨当前样本的最小堆，键是（偏移, 尺寸, 轨序号, 样本序号）。
+    heap: BinaryHeap<Reverse<(usize, usize, usize, usize)>>,
 }
 
 impl<'plan> SampleWalk<'plan> {
@@ -901,7 +901,12 @@ impl<'plan> SampleWalk<'plan> {
         let mut heap = BinaryHeap::with_capacity(cursors.len());
         for cursor in cursors.iter_mut() {
             if let Some(sample) = cursor.next()? {
-                heap.push(Reverse((sample.offset, sample.size, sample.track)));
+                heap.push(Reverse((
+                    sample.offset,
+                    sample.size,
+                    sample.track,
+                    sample.index,
+                )));
             }
         }
         Ok(SampleWalk { cursors, heap })
@@ -911,26 +916,28 @@ impl<'plan> SampleWalk<'plan> {
     fn peek(&self) -> Option<PlannedSample> {
         self.heap
             .peek()
-            .map(|Reverse((offset, size, track))| PlannedSample {
+            .map(|Reverse((offset, size, track, index))| PlannedSample {
                 offset: *offset,
                 size: *size,
                 track: *track,
+                index: *index,
             })
     }
 
     /// 消费当前最靠前的样本，并把那条轨推进一个。
     fn advance(&mut self) -> Result<Option<PlannedSample>> {
-        let Some(Reverse((offset, size, track))) = self.heap.pop() else {
+        let Some(Reverse((offset, size, track, index))) = self.heap.pop() else {
             return Ok(None);
         };
         if let Some(next) = self.cursors[track].next()? {
             self.heap
-                .push(Reverse((next.offset, next.size, next.track)));
+                .push(Reverse((next.offset, next.size, next.track, next.index)));
         }
         Ok(Some(PlannedSample {
             offset,
             size,
             track,
+            index,
         }))
     }
 }
