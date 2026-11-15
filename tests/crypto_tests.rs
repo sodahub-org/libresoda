@@ -152,6 +152,29 @@ fn stsz_fixed_box(sample_size: u32, sample_count: u32) -> Vec<u8> {
     mp4_box(b"stsz", &payload)
 }
 
+/// 构造一张 `stsc`：每条 `(first_chunk, samples_per_chunk)`。
+fn stsc_box(entries: &[(u32, u32)]) -> Vec<u8> {
+    let mut payload = vec![0u8; 8 + entries.len() * 12];
+    payload[4..8].copy_from_slice(&(entries.len() as u32).to_be_bytes());
+    for (index, (first_chunk, samples_per_chunk)) in entries.iter().enumerate() {
+        let start = 8 + index * 12;
+        payload[start..start + 4].copy_from_slice(&first_chunk.to_be_bytes());
+        payload[start + 4..start + 8].copy_from_slice(&samples_per_chunk.to_be_bytes());
+    }
+    mp4_box(b"stsc", &payload)
+}
+
+/// 构造一张 32 位 `stco`。
+fn stco_box(offsets: &[u32]) -> Vec<u8> {
+    let mut payload = vec![0u8; 8 + offsets.len() * 4];
+    payload[4..8].copy_from_slice(&(offsets.len() as u32).to_be_bytes());
+    for (index, offset) in offsets.iter().enumerate() {
+        let start = 8 + index * 4;
+        payload[start..start + 4].copy_from_slice(&offset.to_be_bytes());
+    }
+    mp4_box(b"stco", &payload)
+}
+
 /// 把一段 `stbl` 载荷包成完整 `trak`（`stbl` → `minf` → `mdia` → `trak`）。
 fn trak_with_stbl_payload(stbl_payload: &[u8]) -> Vec<u8> {
     let stbl = mp4_box(b"stbl", stbl_payload);
@@ -1875,6 +1898,39 @@ fn decrypt_rejects_truncated_sample_table_count() {
     file[count_offset..count_offset + 4].copy_from_slice(&(count + 1).to_be_bytes());
 
     let err = decrypt_audio_with_key(&file, &KEY).expect_err("stco 声明数大于实际条目应报错");
+    assert!(err.to_string().contains("invalid sample table"), "{err}");
+}
+
+/// 票 #49：同一条轨的 chunk 偏移倒退。两个 chunk 只是写反了顺序，按偏移排正后
+/// 正好铺满 `mdat`——旧实现会先全量排序，所以能解出来；新实现按损坏拒绝
+/// （口径与依据见 PORTING.md）。
+#[test]
+fn decrypt_rejects_backwards_chunk_offsets() {
+    let mut stbl_payload = Vec::new();
+    stbl_payload.extend_from_slice(&stsz_fixed_box(8, 2));
+    stbl_payload.extend_from_slice(&stsc_box(&[(1, 1)]));
+    stbl_payload.extend_from_slice(&stco_box(&[0, 0])); // 偏移按 moov 长度回填
+    stbl_payload.extend_from_slice(&mp4_box(b"senc", &senc_payload_for(&[[1u8; 8], [2u8; 8]])));
+    let trak = trak_with_stbl_payload(&stbl_payload);
+
+    let mut file = mp4_box(b"moov", &trak);
+    let payload_start = (file.len() + 8) as u32;
+    file.extend_from_slice(&mp4_box(b"mdat", &[0u8; 16]));
+    // chunk 1 指到后半段、chunk 2 指到前半段：轨内偏移倒退。
+    let stco = find_box_deep(&file, b"stco", 0, file.len()).expect("stco");
+    let entry = stco.offset + 16; // 8 字节 box 头 + 4 version/flags + 4 条目数
+    file[entry..entry + 4].copy_from_slice(&(payload_start + 8).to_be_bytes());
+    file[entry + 4..entry + 8].copy_from_slice(&payload_start.to_be_bytes());
+
+    let err = decrypt_audio_with_key(&file, &KEY).expect_err("整块应拒绝偏移倒退的表");
+    assert!(err.to_string().contains("invalid sample table"), "{err}");
+    let mut input = Dribble {
+        data: &file,
+        pos: 0,
+        step: 5,
+    };
+    let mut out = Vec::new();
+    let err = decrypt_stream(&mut input, &KEY, &mut out).expect_err("流式也应拒绝");
     assert!(err.to_string().contains("invalid sample table"), "{err}");
 }
 
