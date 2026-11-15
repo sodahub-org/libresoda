@@ -951,7 +951,8 @@ fn decrypt_rejects_unaccounted_bytes_in_second_mdat() {
     let second =
         find_box(&file, b"mdat", first.offset + first.size, file.len()).expect("第二个 mdat");
     let new_size = (second.size + 7) as u32;
-    file[second.offset..second.offset + 4].copy_from_slice(&new_size.to_be_bytes());
+    let second_offset = second.offset;
+    file[second_offset..second_offset + 4].copy_from_slice(&new_size.to_be_bytes());
     file.extend_from_slice(&[0xEEu8; 7]);
 
     assert!(
@@ -1009,7 +1010,8 @@ fn decrypt_rejects_multi_mdat_without_tables() {
     let (mut file, _, _) = two_mdat_fixture(false, &[], false);
     for kind in [b"stsc", b"stco"] {
         while let Some(found) = find_box_deep(&file, kind, 0, file.len()) {
-            file[found.offset + 4..found.offset + 8].copy_from_slice(b"junk");
+            let type_start = found.offset + 4;
+            file[type_start..type_start + 4].copy_from_slice(b"junk");
         }
     }
 
