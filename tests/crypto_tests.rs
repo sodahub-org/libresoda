@@ -178,7 +178,7 @@ fn decrypt_rejects_4m_samples_at_plan_cap() {
 
     let started = std::time::Instant::now();
     let err = decrypt_audio_with_key(&file, &KEY).unwrap_err();
-    // 这句话只有 `parse_stsz_limited` 在分配尺寸表之前会报，锁死拒绝点。
+    // 这句话只有尺寸表解析在展开样本之前会报，锁死拒绝点。
     assert_eq!(err.to_string(), "sample table is unreasonably large");
     assert!(
         started.elapsed().as_secs() < 5,
