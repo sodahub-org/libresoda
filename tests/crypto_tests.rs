@@ -1902,37 +1902,48 @@ fn decrypt_rejects_truncated_sample_table_count() {
     assert!(err.to_string().contains("invalid sample table"), "{err}");
 }
 
-/// 票 #49：同一条轨的 chunk 偏移倒退。两个 chunk 只是写反了顺序，按偏移排正后
-/// 正好铺满 `mdat`——旧实现会先全量排序，所以能解出来；新实现按损坏拒绝
-/// （口径与依据见 PORTING.md）。
+/// 票 #49：同一条轨的 chunk 偏移在文件里乱序（样本跨 mdat 分布时就会出现）。
+/// 按偏移排好 chunk 表后解密，结果与旧实现的「全量排序」一致。
 #[test]
-fn decrypt_rejects_backwards_chunk_offsets() {
+fn decrypt_handles_out_of_order_chunk_offsets() {
+    let plain0: Vec<u8> = (0..8).collect();
+    let plain1: Vec<u8> = (8..16).collect();
+    let iv0 = [1u8; 8];
+    let iv1 = [2u8; 8];
+
     let mut stbl_payload = Vec::new();
     stbl_payload.extend_from_slice(&stsz_fixed_box(8, 2));
     stbl_payload.extend_from_slice(&stsc_box(&[(1, 1)]));
     stbl_payload.extend_from_slice(&stco_box(&[0, 0])); // 偏移按 moov 长度回填
-    stbl_payload.extend_from_slice(&mp4_box(b"senc", &senc_payload_for(&[[1u8; 8], [2u8; 8]])));
+    stbl_payload.extend_from_slice(&mp4_box(b"senc", &senc_payload_for(&[iv0, iv1])));
     let trak = trak_with_stbl_payload(&stbl_payload);
 
     let mut file = mp4_box(b"moov", &trak);
     let payload_start = (file.len() + 8) as u32;
-    file.extend_from_slice(&mp4_box(b"mdat", &[0u8; 16]));
-    // chunk 1 指到后半段、chunk 2 指到前半段：轨内偏移倒退。
+    // 文件顺序：先第 2 个样本（chunk 2），再第 1 个样本（chunk 1）。
+    let mut mdat = ctr_apply(&plain1, &iv1);
+    mdat.extend_from_slice(&ctr_apply(&plain0, &iv0));
+    file.extend_from_slice(&mp4_box(b"mdat", &mdat));
+
     let stco = find_box_deep(&file, b"stco", 0, file.len()).expect("stco");
     let entry = stco.offset + 16; // 8 字节 box 头 + 4 version/flags + 4 条目数
     file[entry..entry + 4].copy_from_slice(&(payload_start + 8).to_be_bytes());
     file[entry + 4..entry + 8].copy_from_slice(&payload_start.to_be_bytes());
 
-    let err = decrypt_audio_with_key(&file, &KEY).expect_err("整块应拒绝偏移倒退的表");
-    assert!(err.to_string().contains("invalid sample table"), "{err}");
+    let decrypted = decrypt_audio_with_key(&file, &KEY).expect("乱序 chunk 应按偏移解密");
+    let mdat_box = find_box(&decrypted, b"mdat", 0, decrypted.len()).expect("mdat");
+    let mut expected = plain1.clone();
+    expected.extend_from_slice(&plain0);
+    assert_eq!(mdat_box.data, expected.as_slice());
+
     let mut input = Dribble {
         data: &file,
         pos: 0,
         step: 5,
     };
     let mut out = Vec::new();
-    let err = decrypt_stream(&mut input, &KEY, &mut out).expect_err("流式也应拒绝");
-    assert!(err.to_string().contains("invalid sample table"), "{err}");
+    decrypt_stream(&mut input, &KEY, &mut out).expect("流式也应解出同样结果");
+    assert_eq!(out, decrypted);
 }
 
 /// moov 里一条 trak 都没有：明确报出来，不 panic。
