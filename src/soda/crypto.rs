@@ -23,6 +23,14 @@ const AES_BLOCK_SIZE: usize = 16;
 /// 正常音频（48kHz、每帧约 1024 采样）即使数小时也只有几万条，4M 足够宽裕。
 const MAX_SAMPLE_ENTRIES: usize = 4 * 1024 * 1024;
 
+/// 防御性上限：解密计划阶段允许展开的样本总数（所有轨合计，票 #44）。
+///
+/// 计划要把每个样本的尺寸、位置、`senc` 记录都落内存，64 位下约 100 字节/样本：
+/// 沿用 `MAX_SAMPLE_ENTRIES`（4M）时最坏峰值约 400–500MB。正常曲目只有几千到几万条，
+/// 1M 足够约 6 小时音频（48kHz AAC），把最坏元数据压到 ~100MB 量级。
+/// 只约束计划阶段；`parse_stsz`/`parse_senc` 等独立解析仍用更宽的 `MAX_SAMPLE_ENTRIES`。
+const MAX_PLAN_SAMPLES: usize = 1024 * 1024;
+
 /// 流式解密允许缓存在内存里的「mdat 之前」字节上限。
 ///
 /// 正常文件的 `ftyp` + `moov` 只有几十 KB；这里设 8MB 是为了防止损坏或被
@@ -317,8 +325,8 @@ fn plan_decryption(
 
     let mut track_data = Vec::with_capacity(tracks.len());
     let mut any_senc = false;
-    // 所有轨合计的样本数与字节数。单轨已受 MAX_SAMPLE_ENTRIES 限制，合计再用同一个值
-    // 兜住，防止很多条轨各自声明几百万样本，把位置表放大到几 GiB。
+    // 所有轨合计的样本数与字节数。计划阶段用更紧的 MAX_PLAN_SAMPLES 兜住（票 #44），
+    // 防止很多条轨各自声明几百万样本，把位置表放大到几 GiB。
     let mut total_samples = 0usize;
     let mut total_sample_bytes = 0usize;
     // 老代码先在整个 moov 里找直接的 `senc` 子 box；标准布局不在那里，但保留这条兜底，
@@ -336,7 +344,7 @@ fn plan_decryption(
         let stsz = child_box(data, b"stsz", &stbl)
             .ok_or_else(|| SodaError::crypto("stsz box not found"))?;
         // 先按剩余预算夹紧再分配：声明值超过合计上限时直接拒绝，不先建一个几百万条的 Vec。
-        let remaining_samples = MAX_SAMPLE_ENTRIES.saturating_sub(total_samples);
+        let remaining_samples = MAX_PLAN_SAMPLES.saturating_sub(total_samples);
         let sizes = parse_stsz_limited(stsz.data, remaining_samples)
             .ok_or_else(|| SodaError::crypto("sample table is unreasonably large"))?;
         total_samples += sizes.len();
@@ -439,7 +447,7 @@ fn plan_decryption(
     let mdat_end = mdat_payload_start
         .checked_add(mdat_payload_len)
         .ok_or_else(|| SodaError::crypto("mdat size overflow"))?;
-    let mut planned = Vec::new();
+    let mut planned = Vec::with_capacity(total_samples);
     if !any_without_tables {
         for (track_index, track) in track_data.iter().enumerate() {
             for (sample_index, (offset, size)) in track
@@ -527,7 +535,8 @@ fn child_box<'a>(data: &'a [u8], kind: &[u8; 4], parent: &Mp4Box<'a>) -> Option<
 /// 表类 box 的公共头：版本/标志后跟条目数。
 ///
 /// 声明条目数超过实际可读条目数或硬上限时返回 `None`；调用方按损坏文件报错，
-/// 不能把截短后的表当成完整表。
+/// 不能把截短后的表当成完整表。硬上限取 `MAX_PLAN_SAMPLES`：chunk 数不会超过样本数
+/// （每个 chunk 至少装一个样本），计划上限同样兜得住（票 #44）。
 ///
 /// 上游没有这个辅助；票 #42 新增。
 fn table_entry_count(data: &[u8], entry_size: usize) -> Option<usize> {
@@ -536,7 +545,7 @@ fn table_entry_count(data: &[u8], entry_size: usize) -> Option<usize> {
     }
     let declared = u32::from_be_bytes([data[4], data[5], data[6], data[7]]) as usize;
     let available = data.len().saturating_sub(8) / entry_size;
-    if declared > available || declared > MAX_SAMPLE_ENTRIES {
+    if declared > available || declared > MAX_PLAN_SAMPLES {
         return None;
     }
     Some(declared)
@@ -1143,5 +1152,29 @@ mod tests {
         data[8..12].copy_from_slice(&2u32.to_be_bytes());
         data[12..16].copy_from_slice(&16u32.to_be_bytes());
         assert!(parse_stsz_limited(&data, 10).is_none());
+    }
+
+    /// 票 #44：计划上限边界——恰好 `MAX_PLAN_SAMPLES` 条放行，多一条就在分配前拒绝。
+    #[test]
+    fn parse_stsz_limited_plan_cap_boundary() {
+        let mut data = vec![0u8; 12];
+        data[4..8].copy_from_slice(&1u32.to_be_bytes());
+        data[8..12].copy_from_slice(&(MAX_PLAN_SAMPLES as u32).to_be_bytes());
+        assert_eq!(
+            parse_stsz_limited(&data, MAX_PLAN_SAMPLES).map(|s| s.len()),
+            Some(MAX_PLAN_SAMPLES)
+        );
+        data[8..12].copy_from_slice(&(MAX_PLAN_SAMPLES as u32 + 1).to_be_bytes());
+        assert!(parse_stsz_limited(&data, MAX_PLAN_SAMPLES).is_none());
+    }
+
+    /// 票 #44：chunk 表条目数也受计划上限约束——数据装得下但声明超过上限时拒绝。
+    #[test]
+    fn table_entry_count_rejects_over_plan_cap() {
+        let mut data = vec![0u8; 8 + (MAX_PLAN_SAMPLES + 1) * 4];
+        data[4..8].copy_from_slice(&(MAX_PLAN_SAMPLES as u32 + 1).to_be_bytes());
+        assert_eq!(table_entry_count(&data, 4), None);
+        data[4..8].copy_from_slice(&(MAX_PLAN_SAMPLES as u32).to_be_bytes());
+        assert_eq!(table_entry_count(&data, 4), Some(MAX_PLAN_SAMPLES));
     }
 }
