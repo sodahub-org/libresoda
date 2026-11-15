@@ -213,6 +213,7 @@ fn decrypt_accepts_100k_samples_under_plan_cap() {
     let file = moov_plus_zero_mdat(&trak, 100_000);
 
     let out = decrypt_audio_with_key(&file, &KEY).unwrap();
+    assert_eq!(out.len(), file.len(), "解密输出应与输入等长");
     // 每条样本 1 字节、IV 全零，解出来每个字节都等于同一段 keystream 的首字节。
     // 逐字节比对，任何一条样本被跳过（保持密文 0）都会露馅。
     let keystream = ctr_apply(&[0u8; 1], &[0u8; 8]);
