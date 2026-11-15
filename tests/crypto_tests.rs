@@ -160,6 +160,7 @@ fn stsc_box(entries: &[(u32, u32)]) -> Vec<u8> {
         let start = 8 + index * 12;
         payload[start..start + 4].copy_from_slice(&first_chunk.to_be_bytes());
         payload[start + 4..start + 8].copy_from_slice(&samples_per_chunk.to_be_bytes());
+        payload[start + 8..start + 12].copy_from_slice(&1u32.to_be_bytes());
     }
     mp4_box(b"stsc", &payload)
 }

@@ -2026,6 +2026,55 @@ mod tests {
         assert_eq!(offsets, vec![100, 200, 300, 400]);
     }
 
+    /// 票 #49：两条轨在同一起点，其中一条是 0 字节——0 字节的先出，游标不会被同位置的
+    /// 非零样本提前推走，覆盖核对不会误判。
+    #[test]
+    fn sample_walk_emits_zero_size_samples_first_at_same_offset() {
+        let sized = TrackPlan {
+            sizes: SampleSizes::Fixed { size: 8, count: 1 },
+            senc: None,
+            stsd: None,
+            layout: TrackLayout::Tables {
+                stsc: vec![StscEntry {
+                    first_chunk: 1,
+                    samples_per_chunk: 1,
+                }],
+                chunks: vec![100],
+            },
+        };
+        let zero = TrackPlan {
+            sizes: SampleSizes::Fixed { size: 0, count: 1 },
+            senc: None,
+            stsd: None,
+            layout: TrackLayout::Tables {
+                stsc: vec![StscEntry {
+                    first_chunk: 1,
+                    samples_per_chunk: 1,
+                }],
+                chunks: vec![100],
+            },
+        };
+        let mut walk = SampleWalk::new(vec![
+            TrackSamples::new(0, &sized),
+            TrackSamples::new(1, &zero),
+        ])
+        .expect("游标应可用");
+        let first = walk.advance().expect("归并应自洽").expect("有样本");
+        assert_eq!((first.offset, first.size, first.track), (100, 0, 1));
+        let second = walk.advance().expect("归并应自洽").expect("有样本");
+        assert_eq!((second.offset, second.size, second.track), (100, 8, 0));
+
+        let mut cover = SampleWalk::new(vec![
+            TrackSamples::new(0, &sized),
+            TrackSamples::new(1, &zero),
+        ])
+        .expect("游标应可用");
+        assert_eq!(
+            cover_mdat_payload(&mut cover, 100, 8).expect("同偏移的 0 字节样本不该挡住覆盖"),
+            2
+        );
+    }
+
     /// 票 #44：chunk 表条目数受传入上限约束——数据装得下但声明超过上限时拒绝。
     #[test]
     fn table_entry_count_rejects_over_plan_cap() {
