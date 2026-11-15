@@ -57,6 +57,8 @@ struct TrackPlan {
 struct DecryptPlan {
     tracks: Vec<TrackPlan>,
     samples: Vec<PlannedSample>,
+    /// 走了「无表首尾相接」的老口径。多 mdat 时这种布局推不出来，要显式拒绝。
+    legacy_layout: bool,
 }
 
 /// `stsc` 的一条记录：从 `first_chunk` 起，每个 chunk 装 `samples_per_chunk` 个样本。
@@ -235,8 +237,7 @@ pub fn decrypt_stream<R: Read, W: Write>(
         .len()
         .checked_add(mdat_header.len())
         .ok_or_else(|| SodaError::crypto("mdat size overflow"))?;
-    let (tracks, samples) = plan_track_samples(&prefix, &moov, mdat_payload_start, usize::MAX)?;
-    let plan = DecryptPlan { tracks, samples };
+    let plan = plan_track_samples(&prefix, &moov, mdat_payload_start, usize::MAX)?;
 
     // 第一个 mdat 的覆盖核对放在写任何输出之前，与整块路径一样先验后写。
     let mut next_sample = 0usize;
@@ -309,6 +310,10 @@ pub fn decrypt_stream<R: Read, W: Write>(
         };
 
         if kind == b"mdat" {
+            // 老口径只认第一个 mdat：后面再出现 mdat 就推不出布局了
+            if plan.legacy_layout {
+                return Err(SodaError::crypto("incomplete sample table"));
+            }
             let payload_start = offset + header_len;
             let payload_len = size - header_len;
             let before = next_sample;
@@ -425,19 +430,23 @@ fn plan_decryption(
         .iter()
         .try_fold(0usize, |sum, &(_, len)| sum.checked_add(len))
         .ok_or_else(|| SodaError::crypto("mdat size overflow"))?;
-    let (tracks, samples) = plan_track_samples(data, moov, first_payload_start, total_payload_len)?;
+    let plan = plan_track_samples(data, moov, first_payload_start, total_payload_len)?;
+    // 老口径只会把样本铺进第一个 mdat；多个 mdat 时布局推不出来，直接拒绝。
+    if plan.legacy_layout && mdats.len() > 1 {
+        return Err(SodaError::crypto("incomplete sample table"));
+    }
 
     // 所有轨的样本合起来必须刚好铺满每一个 mdat 的载荷：中间留空就说明还有
     // 我们没认出来的数据（可能是密文），原样透传会写出不完整的文件，所以宁可报错。
     let mut next_sample = 0usize;
     for &(payload_start, payload_len) in mdats {
-        cover_mdat_payload(&samples, &mut next_sample, payload_start, payload_len)?;
+        cover_mdat_payload(&plan.samples, &mut next_sample, payload_start, payload_len)?;
     }
-    if next_sample != samples.len() {
+    if next_sample != plan.samples.len() {
         return Err(SodaError::crypto("decrypted size mismatch"));
     }
 
-    Ok(DecryptPlan { tracks, samples })
+    Ok(plan)
 }
 
 /// 解析所有轨的样本表，产出按文件偏移排好序的样本位置（不做覆盖核对）。
@@ -450,7 +459,7 @@ fn plan_track_samples(
     moov: &Mp4Box<'_>,
     first_payload_start: usize,
     payload_budget: usize,
-) -> Result<(Vec<TrackPlan>, Vec<PlannedSample>)> {
+) -> Result<DecryptPlan> {
     let moov_end = (moov.offset + moov.size).min(data.len());
     let mut tracks = Vec::new();
     let mut pos = moov.offset + 8;
@@ -639,7 +648,11 @@ fn plan_track_samples(
             stsd: track.stsd,
         })
         .collect();
-    Ok((tracks, planned))
+    Ok(DecryptPlan {
+        tracks,
+        samples: planned,
+        legacy_layout: any_without_tables,
+    })
 }
 
 /// 核对排好序的样本是否刚好铺满一段 `mdat` 载荷，把 `next` 推到第一个不属于这段的样本。
