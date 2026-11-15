@@ -170,9 +170,11 @@ impl SencTable {
             .min(max_by_data)
             .min(max_samples)
             .min(MAX_SAMPLE_ENTRIES);
-        let count = count_senc_records(data, iv_size, has_subsamples, limit);
+        let (count, used) = count_senc_records(data, iv_size, has_subsamples, limit);
         SencTable {
-            data: data.to_vec(),
+            // 只留真正读到的那几条记录：声明的 box 大小可能越过父容器，后面也可能跟着
+            // 大段填充，整段复制会把副本放大到跟文件一样大（票 #49 复查）。
+            data: data[..used].to_vec(),
             iv_size,
             has_subsamples,
             count,
@@ -392,7 +394,8 @@ pub fn decrypt_stream<R: Read, W: Write>(
     let mut walk = plan.walk()?;
 
     // 第一个 mdat 的覆盖核对放在写任何输出之前，与整块路径一样先验后写。
-    // 核对只推进一份副本，真正的游标留给后面的解密。
+    // probe 只造这一次：它核对完一段就停在下一段的起点，写完后 walk 会追上它，
+    // 后面每段继续用它往下核对，不必按 mdat 数复制整份游标。
     let mut probe = walk.clone();
     let first_count = cover_mdat_payload(&mut probe, mdat_payload_start, mdat_payload_len)?;
 
@@ -472,8 +475,7 @@ pub fn decrypt_stream<R: Read, W: Write>(
             }
             let payload_start = offset + header_len;
             let payload_len = size - header_len;
-            // 同样先拿副本核对，通过了再动真正的游标和输出。
-            let mut probe = walk.clone();
+            // 沿用同一个 probe：上一段写完时 walk 已经追上它，这里直接往下核对。
             let count = cover_mdat_payload(&mut probe, payload_start, payload_len)?;
             write_box_header(out, &head, ext)?;
             write_samples(input, out, key_bytes, &mut senc_readers, &mut walk, count)?;
@@ -1675,7 +1677,15 @@ fn skip_senc_record(
 
 /// 数 `senc` 里实际能读到的记录数，最多数 `limit` 条。结果与
 /// `parse_senc_limited(data, iv_size, limit).len()` 一致，但不分配记录。
-fn count_senc_records(data: &[u8], iv_size: usize, has_subsamples: bool, limit: usize) -> usize {
+///
+/// 顺手交回最后一条记录的结束位置：调用方按这个长度截取表，声明的 box 大小越过
+/// 父容器、或后面跟着大段填充时，副本也不会跟着变大（票 #49 复查）。
+fn count_senc_records(
+    data: &[u8],
+    iv_size: usize,
+    has_subsamples: bool,
+    limit: usize,
+) -> (usize, usize) {
     let mut ptr = SENC_HEADER_LEN;
     let mut count = 0usize;
     while count < limit {
@@ -1685,7 +1695,7 @@ fn count_senc_records(data: &[u8], iv_size: usize, has_subsamples: bool, limit: 
         ptr = next;
         count += 1;
     }
-    count
+    (count, ptr)
 }
 
 /// 等价 `decodeBase36`：非 0-9a-z 返回 `0xFF`。
@@ -1959,7 +1969,7 @@ mod tests {
         let mut data = vec![0u8; 8 + 16];
         data[4..8].copy_from_slice(&2u32.to_be_bytes());
         assert_eq!(parse_senc_limited(&data, 8, MAX_SAMPLE_ENTRIES).len(), 2);
-        assert_eq!(count_senc_records(&data, 8, false, MAX_SAMPLE_ENTRIES), 2);
+        assert_eq!(count_senc_records(&data, 8, false, MAX_SAMPLE_ENTRIES).0, 2);
 
         // 截断：声明 3 条、只有 1 条的数据
         let mut truncated = vec![0u8; 8 + 8];
@@ -1969,7 +1979,7 @@ mod tests {
             1
         );
         assert_eq!(
-            count_senc_records(&truncated, 8, false, MAX_SAMPLE_ENTRIES),
+            count_senc_records(&truncated, 8, false, MAX_SAMPLE_ENTRIES).0,
             1
         );
 
@@ -1979,7 +1989,7 @@ mod tests {
         sub[4..8].copy_from_slice(&1u32.to_be_bytes());
         sub[16..18].copy_from_slice(&2u16.to_be_bytes());
         assert_eq!(parse_senc_limited(&sub, 8, MAX_SAMPLE_ENTRIES).len(), 1);
-        assert_eq!(count_senc_records(&sub, 8, true, MAX_SAMPLE_ENTRIES), 1);
+        assert_eq!(count_senc_records(&sub, 8, true, MAX_SAMPLE_ENTRIES).0, 1);
 
         // subsample 表被截断：一条都读不出来，两边结果一致
         let mut broken = vec![0u8; 8 + 8 + 2 + 6];
@@ -1987,7 +1997,29 @@ mod tests {
         broken[4..8].copy_from_slice(&1u32.to_be_bytes());
         broken[16..18].copy_from_slice(&2u16.to_be_bytes());
         assert_eq!(parse_senc_limited(&broken, 8, MAX_SAMPLE_ENTRIES).len(), 0);
-        assert_eq!(count_senc_records(&broken, 8, true, MAX_SAMPLE_ENTRIES), 0);
+        assert_eq!(
+            count_senc_records(&broken, 8, true, MAX_SAMPLE_ENTRIES).0,
+            0
+        );
+    }
+
+    /// 票 #49 复查：`senc` 声明的 box 大小可能越过父容器、后面也可能跟着大段填充，
+    /// 副本只该包含真正读到的那几条记录，不能整段复制。
+    #[test]
+    fn senc_table_copies_only_used_bytes() {
+        // 声明 0 条记录 + 1MB 填充：副本只留公共头。
+        let mut data = vec![7u8; 1024 * 1024];
+        data[4..8].copy_from_slice(&0u32.to_be_bytes());
+        let table = SencTable::parse(&data, 8, MAX_SAMPLE_ENTRIES);
+        assert_eq!(table.count, 0);
+        assert_eq!(table.data.len(), SENC_HEADER_LEN);
+
+        // 正常两条记录：副本正好到第二条记录的结尾，不带后面的填充。
+        let mut two = vec![0u8; 8 + 16 + 4096];
+        two[4..8].copy_from_slice(&2u32.to_be_bytes());
+        let table = SencTable::parse(&two, 8, MAX_SAMPLE_ENTRIES);
+        assert_eq!(table.count, 2);
+        assert_eq!(table.data.len(), 8 + 16);
     }
 
     /// 票 #49：跨轨归并按偏移排序，不同轨的样本交错也按文件顺序产出。
