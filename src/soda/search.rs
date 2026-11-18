@@ -116,11 +116,40 @@ pub fn fetch_search_all_body(
     fetch_pc_search_all(soda, keyword, page, page_size)
 }
 
+/// 按搜索范围取原始回包。
+///
+/// 有签名器时统一走 PC 综合搜索（服务端当前只对带签名的 PC 请求返回结果）；
+/// 没有签名器时保留原来的 Android 分类接口，避免把未签名的综合请求当成
+/// “没有结果”。综合搜索本身仍由 [`fetch_search_all_body`] 处理。
+pub(crate) fn fetch_search_body(
+    soda: &Soda,
+    search_type: &str,
+    keyword: &str,
+    page: i64,
+    page_size: i64,
+) -> Result<Vec<u8>> {
+    if soda.signature_provider().is_some() {
+        fetch_search_all_body(soda, keyword, page, page_size)
+    } else {
+        fetch_android_search(soda, search_type, keyword, page, page_size)
+    }
+}
+
 /// PC 综合搜索（`GET /luna/pc/search/all`），使用应用级签名。
+///
+/// 上游 `music-lib` 没有 PC 综合搜索的等价实现（它只有 Android 搜索）；
+/// 这是按官方 PC 客户端接口新增的实现，不假装存在同名 port。
 fn fetch_pc_search_all(soda: &Soda, keyword: &str, page: i64, page_size: i64) -> Result<Vec<u8>> {
     let Some(provider) = soda.signature_provider() else {
         return Err(SodaError::http("搜索需要配置签名器"));
     };
+    if provider.exposes_credentials_over_plain_http() {
+        return Err(SodaError::http(
+            "signer error: 签名器使用非本机明文 HTTP，拒绝发送搜索凭据",
+        ));
+    }
+    let android_page = page;
+    let android_page_size = page_size;
     let page = page.max(1);
     let page_size = page_size.max(1);
     let credentials = soda.app_credentials().unwrap_or_default();
@@ -203,22 +232,37 @@ fn fetch_pc_search_all(soda: &Soda, keyword: &str, page: i64, page_size: i64) ->
             ts_ms: now_millis(),
             headers: headers.clone(),
         })
-        .map_err(|err| SodaError::http(format!("搜索签名失败: {err}")))?;
+        .map_err(super::signature::with_signer_context)?;
     if signed.is_empty() {
         if provider.allows_empty_signature() {
-            return fetch_android_search(soda, "all", keyword, page, page_size);
+            return fetch_android_search(soda, "all", keyword, android_page, android_page_size);
         }
-        return Err(SodaError::http("搜索签名失败: 签名器返回空结果"));
+        return Err(super::signature::empty_signature_error());
+    }
+    let missing: Vec<&str> = ["x-helios", "x-medusa"]
+        .into_iter()
+        .filter(|name| {
+            !signed
+                .headers
+                .iter()
+                .any(|(key, value)| key.eq_ignore_ascii_case(name) && !value.trim().is_empty())
+        })
+        .collect();
+    if !missing.is_empty() {
+        return Err(SodaError::http(format!(
+            "signer error: 搜索签名缺少请求头 {}",
+            missing.join(", ")
+        )));
+    }
+    let signed_url = super::signature::apply_signature_to_url(&url, &signed);
+    let mut options = RequestOption::new();
+    for (name, value) in &headers {
+        options = options.header(name.clone(), value.clone());
     }
     for (name, value) in &signed.headers {
-        headers.insert(name.clone(), value.clone());
+        options = options.header(name.clone(), value.clone());
     }
-    let url = super::signature::apply_signature_to_url(&url, &signed);
-    let mut options = RequestOption::new();
-    for (name, value) in headers {
-        options = options.header(name, value);
-    }
-    http::get(&url, &[options])
+    http::get(&signed_url, &[options])
 }
 
 /// 等价 `androidSearchOptions`。
@@ -350,7 +394,7 @@ pub(crate) fn parse_playlist_search(body: &[u8]) -> Result<Vec<super::types::Use
 
 /// 等价 `SearchArtist`。
 pub fn search_artist(soda: &Soda, keyword: &str) -> Result<Vec<super::types::Artist>> {
-    let body = fetch_search_all_body(soda, keyword, 1, SODA_ANDROID_SEARCH_PAGE_SIZE)?;
+    let body = fetch_search_body(soda, "artist", keyword, 1, SODA_ANDROID_SEARCH_PAGE_SIZE)?;
     parse_artist_search(&body)
 }
 

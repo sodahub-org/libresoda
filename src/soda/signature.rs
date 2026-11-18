@@ -202,6 +202,15 @@ pub trait SignatureProvider: Send + Sync {
         false
     }
 
+    /// 是否把凭据发往非本机的明文 HTTP 签名端点。
+    ///
+    /// 签名契约要求把完整请求头（含 Cookie）交给签名器；如果签名器是局域网/
+    /// 公网 HTTP，网络观察者可以直接读到这些凭据。搜索这类新链路在发送前会
+    /// 先问这一项；本机回环 HTTP 仍然允许（签名服务通常就在本机）。
+    fn exposes_credentials_over_plain_http(&self) -> bool {
+        false
+    }
+
     /// 名称，便于日志与诊断。
     fn name(&self) -> &'static str;
 }
@@ -415,6 +424,25 @@ impl SignatureProvider for HttpSignature {
             return Err(empty_signature_error());
         }
         Ok(response)
+    }
+
+    fn exposes_credentials_over_plain_http(&self) -> bool {
+        let url = self.url.trim();
+        if !url.to_ascii_lowercase().starts_with("http://") {
+            return false;
+        }
+        let rest = url.get(7..).unwrap_or_default();
+        let authority = rest.split('/').next().unwrap_or_default();
+        let host_port = authority.rsplit('@').next().unwrap_or(authority);
+        let host = if let Some(rest) = host_port.strip_prefix('[') {
+            rest.split(']').next().unwrap_or_default()
+        } else {
+            host_port.split(':').next().unwrap_or(host_port)
+        };
+        !matches!(
+            host.to_ascii_lowercase().as_str(),
+            "127.0.0.1" | "localhost" | "::1" | "[::1]"
+        )
     }
 
     fn name(&self) -> &'static str {
@@ -657,7 +685,7 @@ fn redact_bare_credentials(text: &str) -> String {
     output
 }
 
-fn with_signer_context(error: SodaError) -> SodaError {
+pub(crate) fn with_signer_context(error: SodaError) -> SodaError {
     let text = error.to_string();
     if text.to_ascii_lowercase().starts_with("signer") {
         return error;
@@ -673,7 +701,7 @@ fn with_signer_context(error: SodaError) -> SodaError {
 ///
 /// `is_signer_failure()` 只看文案是否以 `signer` 开头；HTTP、命令与自定义 provider
 /// 兜底三处共用这一句，避免文案漂移。
-fn empty_signature_error() -> SodaError {
+pub(crate) fn empty_signature_error() -> SodaError {
     SodaError::http("signer error: empty signature response")
 }
 
@@ -1190,5 +1218,18 @@ mod tests {
         assert!(text.contains("connect to signer refused"), "{text}");
         // 失败路径不改写请求选项：调用方不能顺手把它当"未签名"继续发。
         assert_header_preserved(&options, "X-Test", "1");
+    }
+    #[test]
+    fn plain_http_signer_exposure_is_scoped_to_remote_hosts() {
+        assert!(HttpSignature::new("http://signer.example.com/sign")
+            .exposes_credentials_over_plain_http());
+        assert!(!HttpSignature::new("https://signer.example.com/sign")
+            .exposes_credentials_over_plain_http());
+        assert!(
+            !HttpSignature::new("http://127.0.0.1:8899/sign").exposes_credentials_over_plain_http()
+        );
+        assert!(
+            !HttpSignature::new("HTTP://LOCALHOST:8899/sign").exposes_credentials_over_plain_http()
+        );
     }
 }
