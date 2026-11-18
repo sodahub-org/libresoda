@@ -113,7 +113,7 @@ pub fn fetch_search_all_body(
     if soda.signature_provider().is_none() {
         return fetch_android_search(soda, "all", keyword, page, page_size);
     }
-    fetch_pc_search_all(soda, keyword, page, page_size)
+    fetch_pc_search_all(soda, keyword, page, page_size, "all")
 }
 
 /// 按搜索范围取原始回包。
@@ -129,7 +129,7 @@ pub(crate) fn fetch_search_body(
     page_size: i64,
 ) -> Result<Vec<u8>> {
     if soda.signature_provider().is_some() {
-        fetch_search_all_body(soda, keyword, page, page_size)
+        fetch_pc_search_all(soda, keyword, page, page_size, search_type)
     } else {
         fetch_android_search(soda, search_type, keyword, page, page_size)
     }
@@ -139,7 +139,13 @@ pub(crate) fn fetch_search_body(
 ///
 /// 上游 `music-lib` 没有 PC 综合搜索的等价实现（它只有 Android 搜索）；
 /// 这是按官方 PC 客户端接口新增的实现，不假装存在同名 port。
-fn fetch_pc_search_all(soda: &Soda, keyword: &str, page: i64, page_size: i64) -> Result<Vec<u8>> {
+fn fetch_pc_search_all(
+    soda: &Soda,
+    keyword: &str,
+    page: i64,
+    page_size: i64,
+    fallback_type: &str,
+) -> Result<Vec<u8>> {
     let Some(provider) = soda.signature_provider() else {
         return Err(SodaError::http("搜索需要配置签名器"));
     };
@@ -235,15 +241,32 @@ fn fetch_pc_search_all(soda: &Soda, keyword: &str, page: i64, page_size: i64) ->
         .map_err(super::signature::with_signer_context)?;
     if signed.is_empty() {
         if provider.allows_empty_signature() {
-            return fetch_android_search(soda, "all", keyword, android_page, android_page_size);
+            return fetch_android_search(
+                soda,
+                fallback_type,
+                keyword,
+                android_page,
+                android_page_size,
+            );
         }
         return Err(super::signature::empty_signature_error());
     }
+    let signed_url = super::signature::apply_signature_to_url(&url, &signed);
+    let mut options = RequestOption::new();
+    for (name, value) in &headers {
+        options = options.header(name.clone(), value.clone());
+    }
+    for (name, value) in &signed.headers {
+        options = options.header(name.clone(), value.clone());
+    }
+    // 校验的是“最终会发出去的合并头”，而不是签名器原始 map：后者可能同时
+    // 出现 X-Helios / x-helios 两个大小写不同的键。
+    let merged = crate::http::merge_options(std::slice::from_ref(&options));
     let missing: Vec<&str> = ["x-helios", "x-medusa"]
         .into_iter()
         .filter(|name| {
-            !signed
-                .headers
+            !merged
+                .headers()
                 .iter()
                 .any(|(key, value)| key.eq_ignore_ascii_case(name) && !value.trim().is_empty())
         })
@@ -254,15 +277,8 @@ fn fetch_pc_search_all(soda: &Soda, keyword: &str, page: i64, page_size: i64) ->
             missing.join(", ")
         )));
     }
-    let signed_url = super::signature::apply_signature_to_url(&url, &signed);
-    let mut options = RequestOption::new();
-    for (name, value) in &headers {
-        options = options.header(name.clone(), value.clone());
-    }
-    for (name, value) in &signed.headers {
-        options = options.header(name.clone(), value.clone());
-    }
     http::get(&signed_url, &[options])
+        .map_err(|err| SodaError::http(super::signature::redact_urls_in_text(&err.to_string())))
 }
 
 /// 等价 `androidSearchOptions`。

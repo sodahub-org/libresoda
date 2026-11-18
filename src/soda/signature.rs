@@ -398,8 +398,31 @@ impl HttpSignature {
     }
 }
 
+fn is_loopback_signer_host(host: Option<&str>) -> bool {
+    let Some(host) = host else {
+        return false;
+    };
+    matches!(
+        host.to_ascii_lowercase().as_str(),
+        "127.0.0.1" | "localhost" | "::1" | "[::1]"
+    )
+}
+
+/// 校验签名器 URL；远程明文 HTTP 会把 Cookie/搜索词暴露给网络。
+fn validate_signer_url(url: &str) -> Result<url::Url> {
+    let parsed = url::Url::parse(url.trim())
+        .map_err(|err| SodaError::http(format!("signer error: invalid signer URL: {err}")))?;
+    if parsed.scheme() == "http" && !is_loopback_signer_host(parsed.host_str()) {
+        return Err(SodaError::http(
+            "signer error: 拒绝把凭据发送到非本机明文 HTTP 签名器，请改用 HTTPS 或本机回环地址",
+        ));
+    }
+    Ok(parsed)
+}
+
 impl SignatureProvider for HttpSignature {
     fn sign(&self, request: &SignRequest) -> Result<SignResponse> {
+        validate_signer_url(&self.url)?;
         let payload = serde_json::to_vec(request)
             .map_err(|err| SodaError::json(format!("signer request encode: {err}")))?;
         let mut option = crate::http::RequestOption::new()
@@ -427,22 +450,10 @@ impl SignatureProvider for HttpSignature {
     }
 
     fn exposes_credentials_over_plain_http(&self) -> bool {
-        let url = self.url.trim();
-        if !url.to_ascii_lowercase().starts_with("http://") {
-            return false;
-        }
-        let rest = url.get(7..).unwrap_or_default();
-        let authority = rest.split('/').next().unwrap_or_default();
-        let host_port = authority.rsplit('@').next().unwrap_or(authority);
-        let host = if let Some(rest) = host_port.strip_prefix('[') {
-            rest.split(']').next().unwrap_or_default()
-        } else {
-            host_port.split(':').next().unwrap_or(host_port)
+        let Ok(parsed) = url::Url::parse(self.url.trim()) else {
+            return true;
         };
-        !matches!(
-            host.to_ascii_lowercase().as_str(),
-            "127.0.0.1" | "localhost" | "::1" | "[::1]"
-        )
+        parsed.scheme() == "http" && !is_loopback_signer_host(parsed.host_str())
     }
 
     fn name(&self) -> &'static str {
@@ -593,7 +604,7 @@ fn next_marker(lowered: &[u8], from: usize, markers: &[&[u8]]) -> Option<usize> 
 }
 
 /// 把文本里出现的每个 `http(s)://…` 令牌交给 [`redact_url_for_error`]。
-fn redact_urls_in_text(text: &str) -> String {
+pub(crate) fn redact_urls_in_text(text: &str) -> String {
     // 大小写不敏感的 scheme（ureq/代理可能回显 `HTTP://`）；ASCII 小写化
     // 不改变字节偏移，找到的 index 可以直接切原文。只 lowercase 一次。
     let lowered = text.to_ascii_lowercase();
